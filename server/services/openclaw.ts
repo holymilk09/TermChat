@@ -5,6 +5,7 @@ import { agents, agentSessions, agentTasks, messages, users, conversations } fro
 import { redis, redisPub } from './redis.js';
 import { logger } from './logger.js';
 import { config } from '../config.js';
+import { liveActivityService } from './live-activity.js';
 import { sql } from 'drizzle-orm';
 
 interface AgentSessionState {
@@ -113,6 +114,17 @@ export class OpenClawBridge {
       type: 'agent.state',
       data: { agentId, state: 'working' },
     }));
+
+    // Start a live activity for mobile clients (Dynamic Island / ongoing notification)
+    liveActivityService.start({
+      agentId,
+      agentName: agent.name,
+      agentIcon: agent.icon ?? null,
+      conversationId,
+      sessionId: session.sessionDbId,
+      ownerId: agent.ownerId ?? '',
+      label: 'Working...',
+    }).catch(err => logger.warn({ err }, 'Failed to start live activity'));
   }
 
   // Dispatch sub-agent task (Brain → Coder)
@@ -217,6 +229,22 @@ export class OpenClawBridge {
             },
           },
         }));
+
+        // Update live activity with current tool action
+        const activityId = `la_${session.sessionDbId}`;
+        if (event.type === 'tool_start') {
+          liveActivityService.update(activityId, {
+            label: `Running ${event.tool}...`,
+            toolName: event.tool,
+            detail: typeof event.input === 'string' ? event.input.slice(0, 120) : null,
+          }).catch(() => {});
+        } else {
+          liveActivityService.update(activityId, {
+            label: 'Working...',
+            toolName: null,
+            detail: null,
+          }).catch(() => {});
+        }
         break;
       }
 
@@ -279,6 +307,12 @@ export class OpenClawBridge {
           }));
         }
 
+        // End live activity
+        liveActivityService.end(`la_${session.sessionDbId}`, {
+          state: 'completed',
+          summary: event.summary || null,
+        }).catch(() => {});
+
         this.sessions.delete(session.agentId);
         break;
       }
@@ -301,6 +335,12 @@ export class OpenClawBridge {
           type: 'agent.state',
           data: { agentId: session.agentId, state: 'error' },
         }));
+
+        // End live activity with failure
+        liveActivityService.end(`la_${session.sessionDbId}`, {
+          state: 'failed',
+          summary: event.error || 'Agent encountered an error',
+        }).catch(() => {});
 
         this.sessions.delete(session.agentId);
         break;

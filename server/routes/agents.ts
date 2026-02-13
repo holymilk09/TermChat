@@ -5,6 +5,7 @@ import { agents, agentSessions, agentTasks, users } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { redisPub } from '../services/redis.js';
 import { logger } from '../services/logger.js';
+import { liveActivityService } from '../services/live-activity.js';
 
 const agentsRouter = new Hono();
 
@@ -20,6 +21,26 @@ agentsRouter.get('/', async (c) => {
     .orderBy(desc(agents.createdAt));
 
   return c.json({ data: result });
+});
+
+// GET /api/agents/activities — active live activities for the current user
+// Mobile clients call this on launch / reconnect to restore Dynamic Island / notification state
+agentsRouter.get('/activities', async (c) => {
+  const userId = c.get('userId');
+  const activities = await liveActivityService.getForUser(userId);
+  return c.json({ data: activities });
+});
+
+// GET /api/agents/activities/:activityId — a specific live activity
+agentsRouter.get('/activities/:activityId', async (c) => {
+  const activityId = c.req.param('activityId');
+  const activity = await liveActivityService.get(activityId);
+
+  if (!activity) {
+    return c.json({ error: 'not_found', message: 'Activity not found or expired' }, 404);
+  }
+
+  return c.json(activity);
 });
 
 // POST /api/agents — create agent

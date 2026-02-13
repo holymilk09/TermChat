@@ -142,7 +142,11 @@ export type ServerEvent =
   | { type: 'agent.tool_end'; data: { taskId: string; step: ToolStep } }
   | { type: 'agent.dispatch'; data: { taskId: string; agents: DispatchAgent[] } }
   | { type: 'agent.cost'; data: { sessionId: string; tokens: number; usd: number } }
-  | { type: 'agent.approval'; data: { taskId: string; action: string; detail: string } };
+  | { type: 'agent.approval'; data: { taskId: string; action: string; detail: string } }
+  // Live Activity events (iOS Dynamic Island / Android ongoing notification)
+  | { type: 'activity.start'; data: LiveActivity }
+  | { type: 'activity.update'; data: Partial<LiveActivity> & { id: string } }
+  | { type: 'activity.end'; data: { id: string; state: 'completed' | 'failed'; summary: string | null } };
 
 // Client → Server
 export type ClientEvent =
@@ -166,6 +170,34 @@ export interface DispatchAgent {
   task: string;
   status: string;
 }
+
+// ── Live Activity Types ─────────────────────────
+// Used by iOS (Dynamic Island / Lock Screen) and Android (Ongoing Notification)
+// to show real-time bot task progress when the app is backgrounded.
+
+export interface LiveActivity {
+  id: string;                       // unique activity ID
+  agentId: string;
+  agentName: string;
+  agentIcon: string | null;
+  conversationId: string;
+  sessionId: string;
+  state: LiveActivityState;
+  label: string;                    // human-readable action: "Analyzing code..."
+  detail: string | null;            // optional extra context: "file: main.ts"
+  toolName: string | null;          // current tool if any
+  startedAt: string;                // ISO timestamp of when activity began
+  updatedAt: string;                // ISO timestamp of last update
+  metadata: Record<string, unknown>;
+}
+
+export type LiveActivityState = 'running' | 'waiting' | 'paused' | 'completed' | 'failed';
+
+// Server → Client live activity events
+export type LiveActivityEvent =
+  | { type: 'activity.start'; data: LiveActivity }
+  | { type: 'activity.update'; data: Partial<LiveActivity> & { id: string } }
+  | { type: 'activity.end'; data: { id: string; state: 'completed' | 'failed'; summary: string | null } };
 
 // ── API Types ───────────────────────────────────
 
