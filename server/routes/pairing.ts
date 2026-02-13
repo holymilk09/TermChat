@@ -21,6 +21,7 @@ const pairingGenerateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, keyP
 const pairingExchangeLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, keyPrefix: 'pair-ex' });
 const deviceAuthLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: 'dev-auth' });
 const tokenVerifyLimit = rateLimit({ windowMs: 60 * 1000, max: 60, keyPrefix: 'tok-verify' });
+const devicePollLimit = rateLimit({ windowMs: 60 * 1000, max: 20, keyPrefix: 'dev-poll' });
 
 const pairingRouter = new Hono();
 
@@ -151,21 +152,24 @@ pairingRouter.post('/exchange', pairingExchangeLimit, async (c) => {
   const rawToken = `agt_${nanoid(12)}_${nanoid(32)}`;
   const tokenHash = await bcrypt.hash(rawToken, BCRYPT_ROUNDS);
 
-  const [agentToken] = await db.insert(agentTokens).values({
-    agentId: agent.id,
-    tokenHash,
-    name: deviceName,
-  }).returning();
+  // FIX: Wrap token creation + agent state update in transaction
+  const agentToken = await db.transaction(async (tx) => {
+    const [token] = await tx.insert(agentTokens).values({
+      agentId: agent.id,
+      tokenHash,
+      name: deviceName,
+    }).returning();
 
-  // Link token ID back to the pairing code
-  await db.update(pairingCodes)
-    .set({ agentToken: agentToken.id })
-    .where(eq(pairingCodes.id, claimed.id));
+    await tx.update(pairingCodes)
+      .set({ agentToken: token.id })
+      .where(eq(pairingCodes.id, claimed.id));
 
-  // Update agent state to idle (connected)
-  await db.update(agents)
-    .set({ state: 'idle', updatedAt: new Date() })
-    .where(eq(agents.id, agent.id));
+    await tx.update(agents)
+      .set({ state: 'idle', updatedAt: new Date() })
+      .where(eq(agents.id, agent.id));
+
+    return token;
+  });
 
   logger.info({ agentId: agent.id }, 'Pairing code exchanged for token');
 
@@ -303,58 +307,72 @@ pairingRouter.post('/device/approve', authMiddleware, async (c) => {
   const name = (typeof agentName === 'string' ? agentName : cfg.name as string) || slug;
   const agentModel = (typeof model === 'string' ? model : cfg.model as string) || 'claude-sonnet-4-5-20250929';
 
-  // Check slug uniqueness
-  const [existingAgent] = await db.select({ id: agents.id })
-    .from(agents)
-    .where(eq(agents.slug, slug))
-    .limit(1);
-
-  if (existingAgent) {
-    return c.json({ error: 'conflict', message: 'Agent slug already taken' }, 409);
+  // Validate slug format
+  if (!isValidSlug(slug)) {
+    return c.json({ error: 'validation_error', message: 'Slug must be 2-64 chars, lowercase alphanumeric and hyphens only' }, 400);
   }
 
-  // FIX: All writes in a single transaction to prevent orphaned records
-  const result = await db.transaction(async (tx) => {
-    const [botUser] = await tx.insert(users).values({
-      username: `agent_${slug}`,
-      displayName: name,
-      isBot: true,
-      botOwnerId: userId,
-      status: 'offline',
-    }).returning();
+  // FIX: All writes in a single transaction, including slug uniqueness check
+  // This prevents the TOCTOU race where two requests both pass the check
+  let result;
+  try {
+    result = await db.transaction(async (tx) => {
+      // Check slug uniqueness inside transaction
+      const [existingAgent] = await tx.select({ id: agents.id })
+        .from(agents)
+        .where(eq(agents.slug, slug))
+        .limit(1);
 
-    const [agent] = await tx.insert(agents).values({
-      botUserId: botUser.id,
-      ownerId: userId,
-      slug,
-      name,
-      model: agentModel,
-      scopes: (Array.isArray(cfg.scopes) ? cfg.scopes : ['read', 'write']) as string[],
-      systemPrompt: typeof cfg.systemPrompt === 'string' ? cfg.systemPrompt : null,
-    }).returning();
+      if (existingAgent) {
+        throw new SlugConflictError();
+      }
 
-    const [conv] = await tx.insert(conversations).values({
-      type: 'agent',
-      name,
-      creatorId: userId,
-    }).returning();
+      const [botUser] = await tx.insert(users).values({
+        username: `agent_${slug}`,
+        displayName: name,
+        isBot: true,
+        botOwnerId: userId,
+        status: 'offline',
+      }).returning();
 
-    await tx.insert(conversationMembers).values([
-      { conversationId: conv.id, userId, role: 'owner' },
-      { conversationId: conv.id, userId: botUser.id, role: 'bot' },
-    ]);
+      const [agent] = await tx.insert(agents).values({
+        botUserId: botUser.id,
+        ownerId: userId,
+        slug,
+        name,
+        model: agentModel,
+        scopes: (Array.isArray(cfg.scopes) ? cfg.scopes : ['read', 'write']) as string[],
+        systemPrompt: typeof cfg.systemPrompt === 'string' ? cfg.systemPrompt : null,
+      }).returning();
 
-    await tx.update(deviceAuthRequests)
-      .set({
-        status: 'approved',
-        userId,
-        agentId: agent.id,
-        approvedAt: new Date(),
-      })
-      .where(eq(deviceAuthRequests.id, request.id));
+      const [conv] = await tx.insert(conversations).values({
+        type: 'agent',
+        name,
+        creatorId: userId,
+      }).returning();
 
-    return { agent, conv };
-  });
+      await tx.insert(conversationMembers).values([
+        { conversationId: conv.id, userId, role: 'owner' },
+        { conversationId: conv.id, userId: botUser.id, role: 'bot' },
+      ]);
+
+      await tx.update(deviceAuthRequests)
+        .set({
+          status: 'approved',
+          userId,
+          agentId: agent.id,
+          approvedAt: new Date(),
+        })
+        .where(eq(deviceAuthRequests.id, request.id));
+
+      return { agent, conv };
+    });
+  } catch (err) {
+    if (err instanceof SlugConflictError) {
+      return c.json({ error: 'conflict', message: 'Agent slug already taken' }, 409);
+    }
+    throw err;
+  }
 
   logger.info({ userId, agentId: result.agent.id }, 'Device auth approved');
 
@@ -391,7 +409,7 @@ pairingRouter.post('/device/deny', authMiddleware, async (c) => {
 });
 
 // POST /api/pairing/device/token — terminal polls this to get token after approval
-pairingRouter.post('/device/token', async (c) => {
+pairingRouter.post('/device/token', devicePollLimit, async (c) => {
   const body = await c.req.json();
   const { deviceCode } = body;
 
@@ -590,6 +608,19 @@ pairingRouter.delete('/tokens/:tokenId', authMiddleware, async (c) => {
 // ═══════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════
+
+class SlugConflictError extends Error {
+  constructor() { super('slug_conflict'); }
+}
+
+// Slug validation: 2-64 chars, lowercase alphanumeric and hyphens, no leading/trailing hyphens
+const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$/;
+
+function isValidSlug(slug: string): boolean {
+  if (slug.length < 2 || slug.length > 64) return false;
+  if (slug.length === 2) return /^[a-z0-9]{2}$/.test(slug);
+  return SLUG_REGEX.test(slug);
+}
 
 function generatePairingCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I,O,0,1
