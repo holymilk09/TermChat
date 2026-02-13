@@ -126,15 +126,24 @@ export default {
       }
     });
 
+    ws.on('error', (err) => {
+      // Log but don't crash — close event will handle reconnect
+      console.error(`[termchat] WebSocket error: ${err.message}`);
+    });
+
+    let reconnectAttempts = 0;
     ws.on('close', () => {
-      // Reconnect after 3 seconds
+      // Exponential backoff: 3s, 6s, 12s, 24s, max 60s
+      const delay = Math.min(3000 * Math.pow(2, reconnectAttempts), 60000);
+      reconnectAttempts++;
       setTimeout(() => {
         config._reconnect?.();
-      }, 3000);
+      }, delay);
     });
 
     // Return cleanup function
     return () => {
+      reconnectAttempts = Infinity; // prevent reconnect on intentional close
       ws.close();
     };
   },
@@ -354,7 +363,7 @@ function loadConfig() {
 
 function saveConfig(config) {
   if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
+    mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   }
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
 }

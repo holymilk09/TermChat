@@ -316,7 +316,7 @@ agentsRouter.get('/:id/cost', async (c) => {
   return c.json(costSummary);
 });
 
-// POST /api/agents/:id/setup — full onboarding: create agent + conversation + pairing code
+// POST /api/agents/:id/setup — full onboarding: create conversation + return instructions
 agentsRouter.post('/:id/setup', async (c) => {
   const userId = c.get('userId');
   const agentId = c.req.param('id');
@@ -330,34 +330,48 @@ agentsRouter.post('/:id/setup', async (c) => {
     return c.json({ error: 'not_found', message: 'Agent not found' }, 404);
   }
 
-  // Create agent conversation if it doesn't exist
-  const existingConvs = await db.select({ id: conversations.id })
-    .from(conversations)
-    .innerJoin(conversationMembers, eq(conversations.id, conversationMembers.conversationId))
-    .where(and(
+  // FIX: Guard against null botUserId
+  if (!agent.botUserId) {
+    return c.json({ error: 'bad_state', message: 'Agent has no bot user configured' }, 500);
+  }
+
+  const botUserId = agent.botUserId;
+
+  // FIX: Find existing agent conversation where the bot is a member
+  const existingConvs = await db.select({ conversationId: conversationMembers.conversationId })
+    .from(conversationMembers)
+    .innerJoin(conversations, and(
+      eq(conversations.id, conversationMembers.conversationId),
       eq(conversations.type, 'agent'),
-      eq(conversationMembers.userId, agent.botUserId!),
     ))
+    .where(eq(conversationMembers.userId, botUserId))
     .limit(1);
 
   let conversationId: string;
 
   if (existingConvs.length > 0) {
-    conversationId = existingConvs[0].id;
+    conversationId = existingConvs[0].conversationId;
   } else {
-    const [conv] = await db.insert(conversations).values({
-      type: 'agent',
-      name: agent.name,
-      creatorId: userId,
-    }).returning();
+    // FIX: Wrap in transaction to prevent orphaned conversation
+    const conv = await db.transaction(async (tx) => {
+      const [newConv] = await tx.insert(conversations).values({
+        type: 'agent',
+        name: agent.name,
+        creatorId: userId,
+      }).returning();
 
-    await db.insert(conversationMembers).values([
-      { conversationId: conv.id, userId, role: 'owner' },
-      { conversationId: conv.id, userId: agent.botUserId!, role: 'bot' },
-    ]);
+      await tx.insert(conversationMembers).values([
+        { conversationId: newConv.id, userId, role: 'owner' },
+        { conversationId: newConv.id, userId: botUserId, role: 'bot' },
+      ]);
+
+      return newConv;
+    });
 
     conversationId = conv.id;
   }
+
+  logger.info({ agentId, conversationId }, 'Agent setup completed');
 
   return c.json({
     agent: {

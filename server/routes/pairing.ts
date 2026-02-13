@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { eq, and, gt } from 'drizzle-orm';
+import { eq, and, gt, isNull } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import bcrypt from 'bcrypt';
 import { db } from '../db/index.js';
@@ -12,11 +12,14 @@ import {
   conversations,
   conversationMembers,
 } from '../db/schema.js';
-import { authMiddleware, generateAccessToken } from '../middleware/auth.js';
-import { redis } from '../services/redis.js';
+import { authMiddleware } from '../middleware/auth.js';
 import { logger } from '../services/logger.js';
 
 const pairingRouter = new Hono();
+
+const PAIRING_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const DEVICE_AUTH_TTL_MS = 15 * 60 * 1000;   // 15 minutes
+const BCRYPT_ROUNDS = 12;
 
 // ═══════════════════════════════════════════════════
 // Pairing Code Flow (app-first)
@@ -43,9 +46,8 @@ pairingRouter.post('/generate', authMiddleware, async (c) => {
     return c.json({ error: 'not_found', message: 'Agent not found' }, 404);
   }
 
-  // Generate a short, human-readable code (e.g., AXRF-7KM2)
   const code = generatePairingCode();
-  const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+  const expiresAt = new Date(Date.now() + PAIRING_CODE_TTL_MS);
 
   // Invalidate any existing pending codes for this agent
   await db.update(pairingCodes)
@@ -63,7 +65,7 @@ pairingRouter.post('/generate', authMiddleware, async (c) => {
     expiresAt,
   }).returning();
 
-  logger.info({ agentId, code }, 'Pairing code generated');
+  logger.info({ agentId }, 'Pairing code generated');
 
   return c.json({
     code: pairing.code,
@@ -82,32 +84,46 @@ pairingRouter.post('/exchange', async (c) => {
   const body = await c.req.json();
   const { code } = body;
 
-  if (!code) {
+  if (!code || typeof code !== 'string') {
     return c.json({ error: 'validation_error', message: 'code is required' }, 400);
   }
 
-  // Find valid pairing code
-  const [pairing] = await db.select()
-    .from(pairingCodes)
-    .where(and(
-      eq(pairingCodes.code, code.toUpperCase()),
-      eq(pairingCodes.status, 'pending'),
-      gt(pairingCodes.expiresAt, new Date()),
-    ))
-    .limit(1);
+  const normalizedCode = code.trim().toUpperCase();
 
-  if (!pairing) {
+  // Validate code format before touching the DB
+  if (!/^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(normalizedCode)) {
     return c.json({ error: 'invalid_code', message: 'Pairing code is invalid, expired, or already used' }, 400);
   }
 
-  if (!pairing.agentId) {
+  const deviceName = typeof body.deviceName === 'string' ? body.deviceName.slice(0, 128) : 'default';
+
+  // FIX: Atomic exchange — UPDATE ... WHERE status = 'pending' RETURNING
+  // Only one request can claim a pending code (prevents race condition)
+  const [claimed] = await db.update(pairingCodes)
+    .set({
+      status: 'exchanged',
+      exchangedAt: new Date(),
+      metadata: { deviceName },
+    })
+    .where(and(
+      eq(pairingCodes.code, normalizedCode),
+      eq(pairingCodes.status, 'pending'),
+      gt(pairingCodes.expiresAt, new Date()),
+    ))
+    .returning();
+
+  if (!claimed) {
+    return c.json({ error: 'invalid_code', message: 'Pairing code is invalid, expired, or already used' }, 400);
+  }
+
+  if (!claimed.agentId) {
     return c.json({ error: 'invalid_code', message: 'No agent associated with this code' }, 400);
   }
 
   // Get agent details
   const [agent] = await db.select()
     .from(agents)
-    .where(eq(agents.id, pairing.agentId))
+    .where(eq(agents.id, claimed.agentId))
     .limit(1);
 
   if (!agent) {
@@ -121,36 +137,30 @@ pairingRouter.post('/exchange', async (c) => {
     displayName: users.displayName,
   })
     .from(users)
-    .where(eq(users.id, pairing.userId))
+    .where(eq(users.id, claimed.userId))
     .limit(1);
 
   // Generate persistent agent token
   const rawToken = `agt_${nanoid(12)}_${nanoid(32)}`;
-  const tokenHash = await bcrypt.hash(rawToken, 12);
+  const tokenHash = await bcrypt.hash(rawToken, BCRYPT_ROUNDS);
 
-  // Store token
   const [agentToken] = await db.insert(agentTokens).values({
     agentId: agent.id,
     tokenHash,
-    name: body.deviceName || 'default',
+    name: deviceName,
   }).returning();
 
-  // Mark pairing code as exchanged
+  // Link token ID back to the pairing code
   await db.update(pairingCodes)
-    .set({
-      status: 'exchanged',
-      exchangedAt: new Date(),
-      agentToken: agentToken.id,
-      metadata: { deviceName: body.deviceName || null },
-    })
-    .where(eq(pairingCodes.id, pairing.id));
+    .set({ agentToken: agentToken.id })
+    .where(eq(pairingCodes.id, claimed.id));
 
   // Update agent state to idle (connected)
   await db.update(agents)
     .set({ state: 'idle', updatedAt: new Date() })
     .where(eq(agents.id, agent.id));
 
-  logger.info({ agentId: agent.id, code }, 'Pairing code exchanged for token');
+  logger.info({ agentId: agent.id }, 'Pairing code exchanged for token');
 
   return c.json({
     token: rawToken,
@@ -215,18 +225,28 @@ pairingRouter.post('/device/authorize', async (c) => {
 
   const userCode = generateUserCode();       // e.g., XK49-BETA
   const deviceCode = nanoid(64);              // long opaque string for polling
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+  const expiresAt = new Date(Date.now() + DEVICE_AUTH_TTL_MS);
+
+  // Validate agentConfig if provided
+  const raw = body.agentConfig;
+  const agentConfig = raw && typeof raw === 'object' && !Array.isArray(raw) ? {
+    slug: typeof raw.slug === 'string' ? raw.slug.slice(0, 64) : undefined,
+    name: typeof raw.name === 'string' ? raw.name.slice(0, 128) : undefined,
+    model: typeof raw.model === 'string' ? raw.model.slice(0, 256) : undefined,
+    scopes: Array.isArray(raw.scopes) ? raw.scopes.filter((s: unknown) => typeof s === 'string') : undefined,
+    systemPrompt: typeof raw.systemPrompt === 'string' ? raw.systemPrompt : undefined,
+  } : {};
 
   const [request] = await db.insert(deviceAuthRequests).values({
     userCode,
     deviceCode,
     status: 'pending',
     scopes: body.scopes || [],
-    agentConfig: body.agentConfig || {},
+    agentConfig,
     expiresAt,
   }).returning();
 
-  logger.info({ userCode }, 'Device auth request created');
+  logger.info('Device auth request created');
 
   return c.json({
     user_code: request.userCode,
@@ -239,20 +259,28 @@ pairingRouter.post('/device/authorize', async (c) => {
 });
 
 // POST /api/pairing/device/approve — user approves from TermChat app
+// FIX: All writes wrapped in a transaction to prevent orphaned records
 pairingRouter.post('/device/approve', authMiddleware, async (c) => {
   const userId = c.get('userId');
   const body = await c.req.json();
   const { userCode, agentName, agentSlug, model } = body;
 
-  if (!userCode) {
+  if (!userCode || typeof userCode !== 'string') {
     return c.json({ error: 'validation_error', message: 'userCode is required' }, 400);
+  }
+
+  const normalizedCode = userCode.trim().toUpperCase();
+
+  // Validate format before DB query
+  if (!/^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(normalizedCode)) {
+    return c.json({ error: 'invalid_code', message: 'Device code is invalid, expired, or already used' }, 400);
   }
 
   // Find pending request
   const [request] = await db.select()
     .from(deviceAuthRequests)
     .where(and(
-      eq(deviceAuthRequests.userCode, userCode.toUpperCase()),
+      eq(deviceAuthRequests.userCode, normalizedCode),
       eq(deviceAuthRequests.status, 'pending'),
       gt(deviceAuthRequests.expiresAt, new Date()),
     ))
@@ -262,10 +290,11 @@ pairingRouter.post('/device/approve', authMiddleware, async (c) => {
     return c.json({ error: 'invalid_code', message: 'Device code is invalid, expired, or already used' }, 400);
   }
 
-  // Create the agent (if terminal-first flow provided config)
-  const slug = agentSlug || (request.agentConfig as any)?.slug || `agent-${nanoid(6)}`;
-  const name = agentName || (request.agentConfig as any)?.name || slug;
-  const agentModel = model || (request.agentConfig as any)?.model || 'claude-sonnet-4-5-20250929';
+  // Derive agent config
+  const cfg = (request.agentConfig as Record<string, unknown>) || {};
+  const slug = (typeof agentSlug === 'string' ? agentSlug : cfg.slug as string) || `agent-${nanoid(6)}`;
+  const name = (typeof agentName === 'string' ? agentName : cfg.name as string) || slug;
+  const agentModel = (typeof model === 'string' ? model : cfg.model as string) || 'claude-sonnet-4-5-20250929';
 
   // Check slug uniqueness
   const [existingAgent] = await db.select({ id: agents.id })
@@ -277,59 +306,60 @@ pairingRouter.post('/device/approve', authMiddleware, async (c) => {
     return c.json({ error: 'conflict', message: 'Agent slug already taken' }, 409);
   }
 
-  // Create bot user
-  const [botUser] = await db.insert(users).values({
-    username: `agent_${slug}`,
-    displayName: name,
-    isBot: true,
-    botOwnerId: userId,
-    status: 'offline',
-  }).returning();
+  // FIX: All writes in a single transaction to prevent orphaned records
+  const result = await db.transaction(async (tx) => {
+    const [botUser] = await tx.insert(users).values({
+      username: `agent_${slug}`,
+      displayName: name,
+      isBot: true,
+      botOwnerId: userId,
+      status: 'offline',
+    }).returning();
 
-  // Create agent
-  const [agent] = await db.insert(agents).values({
-    botUserId: botUser.id,
-    ownerId: userId,
-    slug,
-    name,
-    model: agentModel,
-    scopes: (request.agentConfig as any)?.scopes || ['read', 'write'],
-    systemPrompt: (request.agentConfig as any)?.systemPrompt || null,
-  }).returning();
+    const [agent] = await tx.insert(agents).values({
+      botUserId: botUser.id,
+      ownerId: userId,
+      slug,
+      name,
+      model: agentModel,
+      scopes: (Array.isArray(cfg.scopes) ? cfg.scopes : ['read', 'write']) as string[],
+      systemPrompt: typeof cfg.systemPrompt === 'string' ? cfg.systemPrompt : null,
+    }).returning();
 
-  // Create agent conversation
-  const [conv] = await db.insert(conversations).values({
-    type: 'agent',
-    name,
-    creatorId: userId,
-  }).returning();
+    const [conv] = await tx.insert(conversations).values({
+      type: 'agent',
+      name,
+      creatorId: userId,
+    }).returning();
 
-  await db.insert(conversationMembers).values([
-    { conversationId: conv.id, userId, role: 'owner' },
-    { conversationId: conv.id, userId: botUser.id, role: 'bot' },
-  ]);
+    await tx.insert(conversationMembers).values([
+      { conversationId: conv.id, userId, role: 'owner' },
+      { conversationId: conv.id, userId: botUser.id, role: 'bot' },
+    ]);
 
-  // Approve the request
-  await db.update(deviceAuthRequests)
-    .set({
-      status: 'approved',
-      userId,
-      agentId: agent.id,
-      approvedAt: new Date(),
-    })
-    .where(eq(deviceAuthRequests.id, request.id));
+    await tx.update(deviceAuthRequests)
+      .set({
+        status: 'approved',
+        userId,
+        agentId: agent.id,
+        approvedAt: new Date(),
+      })
+      .where(eq(deviceAuthRequests.id, request.id));
 
-  logger.info({ userId, agentId: agent.id, userCode }, 'Device auth approved');
+    return { agent, conv };
+  });
+
+  logger.info({ userId, agentId: result.agent.id }, 'Device auth approved');
 
   return c.json({
     status: 'approved',
     agent: {
-      id: agent.id,
-      slug: agent.slug,
-      name: agent.name,
+      id: result.agent.id,
+      slug: result.agent.slug,
+      name: result.agent.name,
     },
     conversation: {
-      id: conv.id,
+      id: result.conv.id,
     },
   });
 });
@@ -339,14 +369,14 @@ pairingRouter.post('/device/deny', authMiddleware, async (c) => {
   const body = await c.req.json();
   const { userCode } = body;
 
-  if (!userCode) {
+  if (!userCode || typeof userCode !== 'string') {
     return c.json({ error: 'validation_error', message: 'userCode is required' }, 400);
   }
 
   await db.update(deviceAuthRequests)
     .set({ status: 'denied' })
     .where(and(
-      eq(deviceAuthRequests.userCode, userCode.toUpperCase()),
+      eq(deviceAuthRequests.userCode, userCode.trim().toUpperCase()),
       eq(deviceAuthRequests.status, 'pending'),
     ));
 
@@ -358,7 +388,7 @@ pairingRouter.post('/device/token', async (c) => {
   const body = await c.req.json();
   const { deviceCode } = body;
 
-  if (!deviceCode) {
+  if (!deviceCode || typeof deviceCode !== 'string') {
     return c.json({ error: 'validation_error', message: 'device_code is required' }, 400);
   }
 
@@ -368,7 +398,7 @@ pairingRouter.post('/device/token', async (c) => {
     .limit(1);
 
   if (!request) {
-    return c.json({ error: 'invalid_request', message: 'Unknown device code' }, 400);
+    return c.json({ error: 'invalid_request', message: 'Device code is invalid or expired' }, 400);
   }
 
   // Check expiry
@@ -376,9 +406,9 @@ pairingRouter.post('/device/token', async (c) => {
     return c.json({ error: 'expired_token', message: 'Device code has expired' }, 400);
   }
 
-  // Still waiting for user
+  // Still waiting for user — 202 Accepted (standard for "processing")
   if (request.status === 'pending') {
-    return c.json({ error: 'authorization_pending', message: 'User has not yet approved' }, 428);
+    return c.json({ error: 'authorization_pending', message: 'User has not yet approved' }, 202);
   }
 
   // User denied
@@ -388,6 +418,19 @@ pairingRouter.post('/device/token', async (c) => {
 
   // Approved — generate agent token
   if (request.status === 'approved' && request.agentId) {
+    // FIX: Atomic consume — UPDATE WHERE status='approved' prevents double-poll
+    const [consumed] = await db.update(deviceAuthRequests)
+      .set({ status: 'expired' })
+      .where(and(
+        eq(deviceAuthRequests.id, request.id),
+        eq(deviceAuthRequests.status, 'approved'),
+      ))
+      .returning();
+
+    if (!consumed) {
+      return c.json({ error: 'invalid_request', message: 'Token already issued' }, 400);
+    }
+
     const [agent] = await db.select()
       .from(agents)
       .where(eq(agents.id, request.agentId))
@@ -397,9 +440,8 @@ pairingRouter.post('/device/token', async (c) => {
       return c.json({ error: 'not_found', message: 'Agent no longer exists' }, 404);
     }
 
-    // Generate persistent agent token
     const rawToken = `agt_${nanoid(12)}_${nanoid(32)}`;
-    const tokenHash = await bcrypt.hash(rawToken, 12);
+    const tokenHash = await bcrypt.hash(rawToken, BCRYPT_ROUNDS);
 
     await db.insert(agentTokens).values({
       agentId: agent.id,
@@ -407,17 +449,10 @@ pairingRouter.post('/device/token', async (c) => {
       name: 'device-auth',
     });
 
-    // Mark request as consumed (prevent re-use)
-    await db.update(deviceAuthRequests)
-      .set({ status: 'expired' })
-      .where(eq(deviceAuthRequests.id, request.id));
-
-    // Update agent online
     await db.update(agents)
       .set({ state: 'idle', updatedAt: new Date() })
       .where(eq(agents.id, agent.id));
 
-    // Get owner info
     const [owner] = request.userId ? await db.select({
       username: users.username,
       displayName: users.displayName,
@@ -457,18 +492,29 @@ pairingRouter.post('/device/token', async (c) => {
 // ═══════════════════════════════════════════════════
 
 // POST /api/pairing/verify — verify an agent token (used by gateway)
+// FIX: Accept optional agentId to scope the bcrypt search and prevent DoS
 pairingRouter.post('/verify', async (c) => {
   const body = await c.req.json();
   const { token } = body;
 
-  if (!token || !token.startsWith('agt_')) {
+  if (!token || typeof token !== 'string' || !token.startsWith('agt_')) {
     return c.json({ error: 'unauthorized', message: 'Invalid agent token' }, 401);
   }
 
-  // Find matching token
+  // Validate expected format: agt_{12}_{32}
+  if (token.length < 40 || token.length > 60) {
+    return c.json({ error: 'unauthorized', message: 'Invalid agent token' }, 401);
+  }
+
+  // Scope search by agentId if provided (reduces bcrypt comparisons)
+  const conditions = [isNull(agentTokens.revokedAt)];
+  if (body.agentId && typeof body.agentId === 'string') {
+    conditions.push(eq(agentTokens.agentId, body.agentId));
+  }
+
   const tokens = await db.select()
     .from(agentTokens)
-    .where(eq(agentTokens.revokedAt, null as any));
+    .where(and(...conditions));
 
   for (const t of tokens) {
     if (await bcrypt.compare(token, t.tokenHash)) {
@@ -477,7 +523,6 @@ pairingRouter.post('/verify', async (c) => {
         .set({ lastUsedAt: new Date() })
         .where(eq(agentTokens.id, t.id));
 
-      // Get agent
       const [agent] = await db.select()
         .from(agents)
         .where(eq(agents.id, t.agentId))
@@ -540,7 +585,6 @@ pairingRouter.delete('/tokens/:tokenId', authMiddleware, async (c) => {
 // ═══════════════════════════════════════════════════
 
 function generatePairingCode(): string {
-  // Generate format: XXXX-XXXX (alphanumeric, uppercase, no ambiguous chars)
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I,O,0,1
   let part1 = '';
   let part2 = '';
@@ -552,7 +596,6 @@ function generatePairingCode(): string {
 }
 
 function generateUserCode(): string {
-  // Generate format: XXXX-XXXX (same as pairing but different namespace)
   return generatePairingCode();
 }
 
