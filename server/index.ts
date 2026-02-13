@@ -4,6 +4,7 @@ import { cors } from 'hono/cors';
 import { config } from './config.js';
 import { logger } from './services/logger.js';
 import { setupWebSocketServer } from './ws/server.js';
+import { setupAgentGateway } from './ws/agent-gateway.js';
 
 // Routes
 import auth from './routes/auth.js';
@@ -65,8 +66,9 @@ const server = serve({
   logger.info({ port: info.port, host: config.host }, 'TermChat server started');
 });
 
-// Setup WebSocket server on the same HTTP server
-setupWebSocketServer(server as any);
+// Setup WebSocket servers on the same HTTP server
+setupWebSocketServer(server as any);   // /ws — user connections
+setupAgentGateway(server as any);      // /ws/agent — agent connections
 
 // Start background services
 async function startBackgroundServices() {

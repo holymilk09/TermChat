@@ -250,6 +250,28 @@ export interface PairingExchangeResult {
   };
 }
 
+// ── Agent Gateway Event Types ───────────────────
+// Events sent FROM agents TO the server via /ws/agent
+
+export type AgentClientEvent =
+  | { type: 'message.send'; data: { conversationId: string; content: string; type?: string; metadata?: Record<string, unknown> } }
+  | { type: 'typing.start'; data: { conversationId: string } }
+  | { type: 'typing.stop'; data: { conversationId: string } }
+  | { type: 'task.update'; data: { taskId: string; status: string; output?: unknown } }
+  | { type: 'task.complete'; data: { taskId: string; output?: unknown; tokensUsed?: number; costUsd?: number } }
+  | { type: 'tool.start'; data: { conversationId: string; tool: string; input?: unknown } }
+  | { type: 'tool.end'; data: { conversationId: string; tool: string; output?: unknown; status: string } }
+  | { type: 'state.update'; data: { state: AgentState } };
+
+// Events sent FROM the server TO agents via /ws/agent
+export type AgentServerEvent =
+  | { type: 'connected'; data: { agentId: string; slug: string; name: string; conversations: string[]; protocol: string } }
+  | { type: 'message.new'; data: Message }
+  | { type: 'message.ack'; data: { messageId: string; seq: number } }
+  | { type: 'approval.respond'; data: { taskId: string; approved: boolean } }
+  | { type: 'agent.command'; data: { command: string; args?: unknown } }
+  | { type: 'error'; data: { message: string } };
+
 // ── API Types ───────────────────────────────────
 
 export interface AuthTokens {
