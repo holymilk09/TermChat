@@ -24,5 +24,16 @@ export async function setupCronJobs() {
     }
   );
 
+  // Clean up expired pairing codes and device auth requests every 4 hours
+  await cleanupQueue.add(
+    'expired-pairing',
+    { type: 'expired_pairing' },
+    {
+      repeat: { pattern: '0 */4 * * *' }, // Every 4 hours
+      removeOnComplete: 10,
+      removeOnFail: 50,
+    }
+  );
+
   logger.info('Cron jobs scheduled');
 }

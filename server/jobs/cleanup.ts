@@ -1,11 +1,11 @@
 import { Worker, Job } from 'bullmq';
 import { lt, eq, and, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { messages, agentSessions } from '../db/schema.js';
+import { messages, agentSessions, pairingCodes, deviceAuthRequests } from '../db/schema.js';
 import { logger } from '../services/logger.js';
 
 interface CleanupJobData {
-  type: 'expired_messages' | 'stale_sessions' | 'old_messages';
+  type: 'expired_messages' | 'stale_sessions' | 'old_messages' | 'expired_pairing';
 }
 
 function parseRedisUrl(url: string) {
@@ -28,6 +28,8 @@ export function startCleanupWorker(redisUrl: string) {
           return await cleanupExpiredMessages();
         case 'stale_sessions':
           return await cleanupStaleSessions();
+        case 'expired_pairing':
+          return await cleanupExpiredPairing();
         default:
           logger.warn({ type: job.data.type }, 'Unknown cleanup job type');
       }
@@ -78,4 +80,33 @@ async function cleanupStaleSessions(): Promise<{ cleaned: number }> {
   }
 
   return { cleaned: result.length };
+}
+
+async function cleanupExpiredPairing(): Promise<{ pairingCleaned: number; deviceAuthCleaned: number }> {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24h old
+
+  // Delete expired pairing codes older than 24h
+  const pairingResult = await db.delete(pairingCodes)
+    .where(and(
+      lt(pairingCodes.expiresAt, cutoff),
+      sql`${pairingCodes.status} != 'exchanged'`
+    ))
+    .returning({ id: pairingCodes.id });
+
+  // Delete expired/denied device auth requests older than 24h
+  const deviceResult = await db.delete(deviceAuthRequests)
+    .where(and(
+      lt(deviceAuthRequests.expiresAt, cutoff),
+      sql`${deviceAuthRequests.status} IN ('pending', 'denied', 'expired')`
+    ))
+    .returning({ id: deviceAuthRequests.id });
+
+  if (pairingResult.length > 0 || deviceResult.length > 0) {
+    logger.info(
+      { pairingCodes: pairingResult.length, deviceAuth: deviceResult.length },
+      'Cleaned up expired pairing data'
+    );
+  }
+
+  return { pairingCleaned: pairingResult.length, deviceAuthCleaned: deviceResult.length };
 }

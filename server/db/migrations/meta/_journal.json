@@ -15,6 +15,13 @@
       "when": 1770959266021,
       "tag": "0001_clumsy_madripoor",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1770971397654,
+      "tag": "0002_quiet_quentin_quire",
+      "breakpoints": true
     }
   ]
 }

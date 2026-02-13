@@ -13,7 +13,14 @@ import {
   conversationMembers,
 } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
+import { rateLimit } from '../middleware/rate-limit.js';
 import { logger } from '../services/logger.js';
+
+// Rate limiters for pairing endpoints
+const pairingGenerateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, keyPrefix: 'pair-gen' });
+const pairingExchangeLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, keyPrefix: 'pair-ex' });
+const deviceAuthLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, keyPrefix: 'dev-auth' });
+const tokenVerifyLimit = rateLimit({ windowMs: 60 * 1000, max: 60, keyPrefix: 'tok-verify' });
 
 const pairingRouter = new Hono();
 
@@ -27,7 +34,7 @@ const BCRYPT_ROUNDS = 12;
 // ═══════════════════════════════════════════════════
 
 // POST /api/pairing/generate — create a pairing code for an agent
-pairingRouter.post('/generate', authMiddleware, async (c) => {
+pairingRouter.post('/generate', authMiddleware, pairingGenerateLimit, async (c) => {
   const userId = c.get('userId');
   const body = await c.req.json();
   const { agentId } = body;
@@ -80,7 +87,7 @@ pairingRouter.post('/generate', authMiddleware, async (c) => {
 
 // POST /api/pairing/exchange — OpenClaw CLI exchanges code for a persistent token
 // This endpoint does NOT require user auth — it's called from the terminal
-pairingRouter.post('/exchange', async (c) => {
+pairingRouter.post('/exchange', pairingExchangeLimit, async (c) => {
   const body = await c.req.json();
   const { code } = body;
 
@@ -220,7 +227,7 @@ pairingRouter.get('/:code/status', authMiddleware, async (c) => {
 // ═══════════════════════════════════════════════════
 
 // POST /api/pairing/device/authorize — terminal requests a device auth flow
-pairingRouter.post('/device/authorize', async (c) => {
+pairingRouter.post('/device/authorize', deviceAuthLimit, async (c) => {
   const body = await c.req.json();
 
   const userCode = generateUserCode();       // e.g., XK49-BETA
@@ -493,7 +500,7 @@ pairingRouter.post('/device/token', async (c) => {
 
 // POST /api/pairing/verify — verify an agent token (used by gateway)
 // FIX: Accept optional agentId to scope the bcrypt search and prevent DoS
-pairingRouter.post('/verify', async (c) => {
+pairingRouter.post('/verify', tokenVerifyLimit, async (c) => {
   const body = await c.req.json();
   const { token } = body;
 

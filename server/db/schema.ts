@@ -249,6 +249,7 @@ export const agentTokens = pgTable('agent_tokens', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
   index('idx_agent_tokens_agent').on(table.agentId),
+  index('idx_agent_tokens_revoked').on(table.revokedAt),
 ]);
 
 // ═══════════════════════════════════════════════════
@@ -270,6 +271,7 @@ export const deviceAuthRequests = pgTable('device_auth_requests', {
 }, (table) => [
   index('idx_device_auth_user_code').on(table.userCode),
   index('idx_device_auth_device_code').on(table.deviceCode),
+  index('idx_device_auth_status').on(table.status),
 ]);
 
 // ═══════════════════════════════════════════════════
