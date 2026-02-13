@@ -199,6 +199,57 @@ export type LiveActivityEvent =
   | { type: 'activity.update'; data: Partial<LiveActivity> & { id: string } }
   | { type: 'activity.end'; data: { id: string; state: 'completed' | 'failed'; summary: string | null } };
 
+// ── Pairing & Device Auth Types ─────────────────
+
+export interface PairingCode {
+  code: string;
+  agentId: string | null;
+  status: PairingStatus;
+  expiresAt: string;
+  exchangedAt: string | null;
+  createdAt: string;
+}
+
+export type PairingStatus = 'pending' | 'exchanged' | 'expired';
+
+export interface AgentToken {
+  id: string;
+  agentId: string;
+  name: string | null;
+  lastUsedAt: string | null;
+  createdAt: string;
+}
+
+export interface DeviceAuthRequest {
+  userCode: string;
+  deviceCode: string;
+  verificationUrl: string;
+  expiresIn: number;
+  interval: number;
+}
+
+export type DeviceAuthStatus = 'pending' | 'approved' | 'denied' | 'expired';
+
+export interface PairingExchangeResult {
+  token: string;
+  agent: {
+    id: string;
+    slug: string;
+    name: string;
+    model: string;
+    scopes: string[];
+    systemPrompt: string | null;
+  };
+  owner: {
+    username: string;
+    displayName: string | null;
+  };
+  gateway: {
+    url: string;
+    protocol: string;
+  };
+}
+
 // ── API Types ───────────────────────────────────
 
 export interface AuthTokens {

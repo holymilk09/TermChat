@@ -216,6 +216,63 @@ export const webhooks = pgTable('webhooks', {
 });
 
 // ═══════════════════════════════════════════════════
+// PAIRING_CODES — short-lived codes to link OpenClaw
+// runtimes to TermChat agent identities
+// ═══════════════════════════════════════════════════
+export const pairingCodes = pgTable('pairing_codes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  code: varchar('code', { length: 32 }).unique().notNull(),
+  userId: uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  agentId: uuid('agent_id').references(() => agents.id, { onDelete: 'cascade' }),
+  agentToken: varchar('agent_token', { length: 256 }),
+  status: varchar('status', { length: 16 }).default('pending').notNull(), // pending, exchanged, expired
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  exchangedAt: timestamp('exchanged_at', { withTimezone: true }),
+  metadata: jsonb('metadata').default({}).$type<Record<string, unknown>>(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('idx_pairing_code').on(table.code),
+  index('idx_pairing_user').on(table.userId),
+  index('idx_pairing_expires').on(table.expiresAt),
+]);
+
+// ═══════════════════════════════════════════════════
+// AGENT_TOKENS — persistent tokens for linked runtimes
+// ═══════════════════════════════════════════════════
+export const agentTokens = pgTable('agent_tokens', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  agentId: uuid('agent_id').references(() => agents.id, { onDelete: 'cascade' }).notNull(),
+  tokenHash: varchar('token_hash', { length: 256 }).notNull(),
+  name: varchar('name', { length: 128 }).default('default'),
+  lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('idx_agent_tokens_agent').on(table.agentId),
+]);
+
+// ═══════════════════════════════════════════════════
+// DEVICE_AUTH_REQUESTS — terminal-first auth flow
+// (like `gh auth login` or Netflix on TV)
+// ═══════════════════════════════════════════════════
+export const deviceAuthRequests = pgTable('device_auth_requests', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userCode: varchar('user_code', { length: 16 }).unique().notNull(),
+  deviceCode: varchar('device_code', { length: 128 }).unique().notNull(),
+  userId: uuid('user_id').references(() => users.id),
+  agentId: uuid('agent_id').references(() => agents.id),
+  status: varchar('status', { length: 16 }).default('pending').notNull(), // pending, approved, denied, expired
+  scopes: text('scopes').array().default([]),
+  agentConfig: jsonb('agent_config').default({}).$type<Record<string, unknown>>(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  approvedAt: timestamp('approved_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('idx_device_auth_user_code').on(table.userCode),
+  index('idx_device_auth_device_code').on(table.deviceCode),
+]);
+
+// ═══════════════════════════════════════════════════
 // CRON_JOBS — scheduled agent tasks
 // ═══════════════════════════════════════════════════
 export const cronJobs = pgTable('cron_jobs', {

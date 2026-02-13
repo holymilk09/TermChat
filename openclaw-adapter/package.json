@@ -1,0 +1,33 @@
+{
+  "name": "@termchat/openclaw-provider",
+  "version": "0.1.0",
+  "description": "TermChat messaging provider for OpenClaw AI agents",
+  "type": "module",
+  "main": "src/provider.js",
+  "bin": {
+    "termchat-agent": "bin/cli.js"
+  },
+  "exports": {
+    ".": "./src/provider.js",
+    "./provider": "./src/provider.js"
+  },
+  "files": [
+    "src/",
+    "bin/"
+  ],
+  "keywords": [
+    "openclaw",
+    "termchat",
+    "ai-agent",
+    "messaging",
+    "provider"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/termchat/openclaw-provider"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

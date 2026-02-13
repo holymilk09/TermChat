@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
-import { eq, and, desc, sql } from 'drizzle-orm';
+import { eq, and, desc, sql, isNull } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { agents, agentSessions, agentTasks, users } from '../db/schema.js';
+import { agents, agentSessions, agentTasks, agentTokens, users, conversations, conversationMembers } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { redisPub } from '../services/redis.js';
 import { logger } from '../services/logger.js';
@@ -314,6 +314,129 @@ agentsRouter.get('/:id/cost', async (c) => {
     .where(eq(agentSessions.agentId, agentId));
 
   return c.json(costSummary);
+});
+
+// POST /api/agents/:id/setup — full onboarding: create agent + conversation + pairing code
+agentsRouter.post('/:id/setup', async (c) => {
+  const userId = c.get('userId');
+  const agentId = c.req.param('id');
+
+  const [agent] = await db.select()
+    .from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.ownerId, userId)))
+    .limit(1);
+
+  if (!agent) {
+    return c.json({ error: 'not_found', message: 'Agent not found' }, 404);
+  }
+
+  // Create agent conversation if it doesn't exist
+  const existingConvs = await db.select({ id: conversations.id })
+    .from(conversations)
+    .innerJoin(conversationMembers, eq(conversations.id, conversationMembers.conversationId))
+    .where(and(
+      eq(conversations.type, 'agent'),
+      eq(conversationMembers.userId, agent.botUserId!),
+    ))
+    .limit(1);
+
+  let conversationId: string;
+
+  if (existingConvs.length > 0) {
+    conversationId = existingConvs[0].id;
+  } else {
+    const [conv] = await db.insert(conversations).values({
+      type: 'agent',
+      name: agent.name,
+      creatorId: userId,
+    }).returning();
+
+    await db.insert(conversationMembers).values([
+      { conversationId: conv.id, userId, role: 'owner' },
+      { conversationId: conv.id, userId: agent.botUserId!, role: 'bot' },
+    ]);
+
+    conversationId = conv.id;
+  }
+
+  return c.json({
+    agent: {
+      id: agent.id,
+      slug: agent.slug,
+      name: agent.name,
+      model: agent.model,
+      state: agent.state,
+    },
+    conversationId,
+    connectInstructions: {
+      appFirst: 'Generate a pairing code via POST /api/pairing/generate',
+      terminalFirst: 'Run: npx termchat-agent init',
+      cliLink: 'Run: npx termchat-agent link <CODE>',
+    },
+  });
+});
+
+// GET /api/agents/:id/tokens — list active tokens for an agent
+agentsRouter.get('/:id/tokens', async (c) => {
+  const userId = c.get('userId');
+  const agentId = c.req.param('id');
+
+  const [agent] = await db.select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.ownerId, userId)))
+    .limit(1);
+
+  if (!agent) {
+    return c.json({ error: 'not_found', message: 'Agent not found' }, 404);
+  }
+
+  const tokens = await db.select({
+    id: agentTokens.id,
+    name: agentTokens.name,
+    lastUsedAt: agentTokens.lastUsedAt,
+    createdAt: agentTokens.createdAt,
+  })
+    .from(agentTokens)
+    .where(and(
+      eq(agentTokens.agentId, agentId),
+      isNull(agentTokens.revokedAt),
+    ))
+    .orderBy(desc(agentTokens.createdAt));
+
+  return c.json({ data: tokens });
+});
+
+// DELETE /api/agents/:id/tokens/:tokenId — revoke a specific token
+agentsRouter.delete('/:id/tokens/:tokenId', async (c) => {
+  const userId = c.get('userId');
+  const agentId = c.req.param('id');
+  const tokenId = c.req.param('tokenId');
+
+  const [agent] = await db.select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.ownerId, userId)))
+    .limit(1);
+
+  if (!agent) {
+    return c.json({ error: 'not_found', message: 'Agent not found' }, 404);
+  }
+
+  const [token] = await db.select({ id: agentTokens.id })
+    .from(agentTokens)
+    .where(and(eq(agentTokens.id, tokenId), eq(agentTokens.agentId, agentId)))
+    .limit(1);
+
+  if (!token) {
+    return c.json({ error: 'not_found', message: 'Token not found' }, 404);
+  }
+
+  await db.update(agentTokens)
+    .set({ revokedAt: new Date() })
+    .where(eq(agentTokens.id, tokenId));
+
+  logger.info({ agentId, tokenId }, 'Agent token revoked from agent route');
+
+  return c.json({ message: 'Token revoked' });
 });
 
 export default agentsRouter;

@@ -14,6 +14,7 @@ import uploadRouter from './routes/upload.js';
 import searchRouter from './routes/search.js';
 import botsRouter from './routes/bots.js';
 import agentsRouter from './routes/agents.js';
+import pairingRouter from './routes/pairing.js';
 
 // Services
 import { openclawBridge } from './services/openclaw.js';
@@ -44,6 +45,7 @@ app.route('/api/upload', uploadRouter);
 app.route('/api/search', searchRouter);
 app.route('/api/bots', botsRouter);
 app.route('/api/agents', agentsRouter);
+app.route('/api/pairing', pairingRouter);
 
 // 404 handler
 app.notFound((c) => c.json({ error: 'not_found', message: 'Route not found' }, 404));
