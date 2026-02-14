@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import crypto from 'crypto';
 import { eq, and, gt, isNull } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import bcrypt from 'bcrypt';
@@ -624,11 +625,12 @@ function isValidSlug(slug: string): boolean {
 
 function generatePairingCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I,O,0,1
+  const bytes = crypto.randomBytes(8);
   let part1 = '';
   let part2 = '';
   for (let i = 0; i < 4; i++) {
-    part1 += chars.charAt(Math.floor(Math.random() * chars.length));
-    part2 += chars.charAt(Math.floor(Math.random() * chars.length));
+    part1 += chars.charAt(bytes[i] % chars.length);
+    part2 += chars.charAt(bytes[i + 4] % chars.length);
   }
   return `${part1}-${part2}`;
 }

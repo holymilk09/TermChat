@@ -47,8 +47,3 @@ export const messageRateLimit = rateLimit({
   keyPrefix: 'msg',
 });
 
-export const apiRateLimit = rateLimit({
-  windowMs: 60 * 1000,
-  max: 120,
-  keyPrefix: 'api',
-});

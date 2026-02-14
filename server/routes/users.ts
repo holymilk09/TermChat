@@ -62,6 +62,42 @@ usersRouter.patch('/me', validate(updateUserSchema), async (c) => {
   return c.json(updated);
 });
 
+// GET /api/users/search?q=
+// NOTE: Must be registered BEFORE /:id to avoid being shadowed
+usersRouter.get('/search', async (c) => {
+  const query = c.req.query('q');
+  const userId = c.get('userId');
+
+  if (!query || query.length < 2) {
+    return c.json({ error: 'validation_error', message: 'Search query must be at least 2 characters' }, 400);
+  }
+
+  // Escape LIKE wildcard characters to prevent pattern injection
+  const escaped = query.replace(/[%_]/g, '\\$&');
+
+  const results = await db.select({
+    id: users.id,
+    username: users.username,
+    displayName: users.displayName,
+    avatarUrl: users.avatarUrl,
+    isBot: users.isBot,
+    status: users.status,
+  })
+    .from(users)
+    .where(
+      and(
+        ne(users.id, userId),
+        or(
+          ilike(users.username, `%${escaped}%`),
+          ilike(users.displayName, `%${escaped}%`)
+        )
+      )
+    )
+    .limit(20);
+
+  return c.json({ data: results });
+});
+
 // GET /api/users/:id
 usersRouter.get('/:id', async (c) => {
   const id = c.req.param('id');
@@ -85,38 +121,6 @@ usersRouter.get('/:id', async (c) => {
   }
 
   return c.json(user);
-});
-
-// GET /api/users/search?q=
-usersRouter.get('/search', async (c) => {
-  const query = c.req.query('q');
-  const userId = c.get('userId');
-
-  if (!query || query.length < 2) {
-    return c.json({ error: 'validation_error', message: 'Search query must be at least 2 characters' }, 400);
-  }
-
-  const results = await db.select({
-    id: users.id,
-    username: users.username,
-    displayName: users.displayName,
-    avatarUrl: users.avatarUrl,
-    isBot: users.isBot,
-    status: users.status,
-  })
-    .from(users)
-    .where(
-      and(
-        ne(users.id, userId),
-        or(
-          ilike(users.username, `%${query}%`),
-          ilike(users.displayName, `%${query}%`)
-        )
-      )
-    )
-    .limit(20);
-
-  return c.json({ data: results });
 });
 
 export default usersRouter;

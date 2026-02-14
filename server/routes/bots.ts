@@ -1,9 +1,9 @@
 import { Hono } from 'hono';
-import { eq, and, desc, gt, sql } from 'drizzle-orm';
+import { eq, and, gt, sql } from 'drizzle-orm';
 import bcrypt from 'bcrypt';
 import { nanoid } from 'nanoid';
 import { db } from '../db/index.js';
-import { users, webhooks, messages, conversationMembers, conversations } from '../db/schema.js';
+import { users, webhooks, messages, conversationMembers } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { redis, redisPub } from '../services/redis.js';
 import { logger } from '../services/logger.js';

@@ -30,7 +30,7 @@ const app = new Hono();
 
 // Global middleware
 app.use('*', cors({
-  origin: config.isDev ? '*' : [],
+  origin: config.isDev ? '*' : config.corsOrigins,
   credentials: true,
 }));
 

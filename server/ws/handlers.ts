@@ -163,9 +163,12 @@ async function handleApprovalRespond(
   userId: string,
   data: { taskId: string; approved: boolean }
 ) {
-  // Find which conversation this approval belongs to by checking agent tasks
+  // Find which conversation and agent this approval belongs to
   const { agentTasks } = await import('../db/schema.js');
-  const [task] = await db.select({ conversationId: agentTasks.conversationId })
+  const [task] = await db.select({
+    conversationId: agentTasks.conversationId,
+    agentId: agentTasks.agentId,
+  })
     .from(agentTasks)
     .where(eq(agentTasks.id, data.taskId))
     .limit(1);
@@ -192,8 +195,10 @@ async function handleApprovalRespond(
   // Route to OpenClaw gateway
   await openclawBridge.sendApprovalResponse(data.taskId, data.approved, task.conversationId);
 
-  // Also try routing to directly connected agents
-  sendToAgent(userId, { type: 'approval.respond', data });
+  // Also try routing to directly connected agents (use agentId, not userId)
+  if (task.agentId) {
+    sendToAgent(task.agentId, { type: 'approval.respond', data });
+  }
 
   logger.info({ taskId: data.taskId, approved: data.approved, userId }, 'Approval response routed');
 }

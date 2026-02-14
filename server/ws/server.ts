@@ -8,7 +8,6 @@ import { logger } from '../services/logger.js';
 import type { ClientEvent } from '../../shared/types.js';
 
 const HEARTBEAT_INTERVAL = 30000;
-const CLIENT_TIMEOUT = 35000;
 
 interface ExtendedWebSocket extends WebSocket {
   isAlive: boolean;

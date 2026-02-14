@@ -1,4 +1,5 @@
 import { Context, Next } from 'hono';
+import crypto from 'crypto';
 import jwt, { type SignOptions } from 'jsonwebtoken';
 import { config } from '../config.js';
 
@@ -50,12 +51,7 @@ export function generateAccessToken(user: { id: string; username: string; isBot:
 }
 
 export function generateRefreshToken(): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let result = '';
-  for (let i = 0; i < 64; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
+  return crypto.randomBytes(48).toString('base64url');
 }
 
 export function verifyToken(token: string): JwtPayload {

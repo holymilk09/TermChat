@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { eq, and, desc, sql } from 'drizzle-orm';
+import { eq, and, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { messages, conversationMembers, users } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';

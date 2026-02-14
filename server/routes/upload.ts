@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { eq } from 'drizzle-orm';
+import { eq, and } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { attachments, messages, conversationMembers } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
@@ -62,9 +62,10 @@ uploadRouter.post('/', async (c) => {
       // Verify user is member of the conversation
       const [membership] = await db.select()
         .from(conversationMembers)
-        .where(
-          eq(conversationMembers.conversationId, msg.conversationId)
-        )
+        .where(and(
+          eq(conversationMembers.conversationId, msg.conversationId),
+          eq(conversationMembers.userId, userId)
+        ))
         .limit(1);
 
       if (!membership) {

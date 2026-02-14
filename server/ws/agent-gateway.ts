@@ -27,7 +27,6 @@ import { liveActivityService } from '../services/live-activity.js';
 // ═══════════════════════════════════════════════════
 
 const HEARTBEAT_INTERVAL = 30000;
-const AUTH_TIMEOUT = 10000; // 10s to authenticate after connecting
 
 interface AgentSocket extends WebSocket {
   isAlive: boolean;
@@ -363,10 +362,6 @@ export function isAgentOnline(agentId: string): boolean {
   return !!connections && connections.size > 0;
 }
 
-export function getConnectedAgentCount(): number {
-  return agentConnections.size;
-}
-
 /** Send an event to a specific agent (all connections) */
 export function sendToAgent(agentId: string, event: object): boolean {
   const connections = agentConnections.get(agentId);
@@ -557,8 +552,11 @@ async function handleTaskComplete(
     })
     .where(eq(agentTasks.id, data.taskId));
 
+  // Capture sessionId before clearing it
+  const completedSessionId = ws.sessionId;
+
   // End the session if this was the main task
-  if (ws.sessionId) {
+  if (completedSessionId) {
     await db.update(agentSessions)
       .set({
         state: 'completed',
@@ -566,9 +564,9 @@ async function handleTaskComplete(
         tokensUsed: data.tokensUsed || 0,
         costUsd: String(data.costUsd || 0),
       })
-      .where(eq(agentSessions.id, ws.sessionId));
+      .where(eq(agentSessions.id, completedSessionId));
 
-    liveActivityService.end(`la_${ws.sessionId}`, {
+    liveActivityService.end(`la_${completedSessionId}`, {
       state: 'completed',
       summary: null,
     }).catch(() => {});
@@ -601,7 +599,7 @@ async function handleTaskComplete(
       publishToChannel(`conv:${task.conversationId}`, {
         type: 'agent.cost',
         data: {
-          sessionId: ws.sessionId,
+          sessionId: completedSessionId,
           tokens: data.tokensUsed || 0,
           usd: data.costUsd || 0,
         },
