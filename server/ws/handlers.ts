@@ -5,6 +5,8 @@ import { messages, conversationMembers, users, messageStatus, conversations } fr
 import { redis, redisPub } from '../services/redis.js';
 import { logger } from '../services/logger.js';
 import { subscribeToChannel, publishToChannel } from './rooms.js';
+import { openclawBridge } from '../services/openclaw.js';
+import { sendToAgent } from './agent-gateway.js';
 import type { ClientEvent } from '../../shared/types.js';
 
 export async function handleClientEvent(ws: WebSocket, userId: string, username: string, event: ClientEvent) {
@@ -20,6 +22,12 @@ export async function handleClientEvent(ws: WebSocket, userId: string, username:
       break;
     case 'message.read':
       await handleMessageRead(userId, event.data.conversationId, event.data.upToSeq);
+      break;
+    case 'approval.respond':
+      await handleApprovalRespond(userId, event.data);
+      break;
+    case 'agent.command':
+      await handleAgentCommand(userId, event.data);
       break;
     default:
       logger.warn({ type: (event as any).type }, 'Unknown client event type');
@@ -149,6 +157,62 @@ async function handleMessageRead(userId: string, conversationId: string, upToSeq
         eq(messageStatus.userId, userId)
       ));
   }
+}
+
+async function handleApprovalRespond(
+  userId: string,
+  data: { taskId: string; approved: boolean }
+) {
+  // Find which conversation this approval belongs to by checking agent tasks
+  const { agentTasks } = await import('../db/schema.js');
+  const [task] = await db.select({ conversationId: agentTasks.conversationId })
+    .from(agentTasks)
+    .where(eq(agentTasks.id, data.taskId))
+    .limit(1);
+
+  if (!task?.conversationId) {
+    logger.warn({ taskId: data.taskId }, 'Approval response for unknown task');
+    return;
+  }
+
+  // Verify user is a member of the conversation
+  const [membership] = await db.select()
+    .from(conversationMembers)
+    .where(and(
+      eq(conversationMembers.conversationId, task.conversationId),
+      eq(conversationMembers.userId, userId)
+    ))
+    .limit(1);
+
+  if (!membership) {
+    logger.warn({ userId, taskId: data.taskId }, 'Approval from non-member');
+    return;
+  }
+
+  // Route to OpenClaw gateway
+  await openclawBridge.sendApprovalResponse(data.taskId, data.approved, task.conversationId);
+
+  // Also try routing to directly connected agents
+  sendToAgent(userId, { type: 'approval.respond', data });
+
+  logger.info({ taskId: data.taskId, approved: data.approved, userId }, 'Approval response routed');
+}
+
+async function handleAgentCommand(
+  userId: string,
+  data: { command: string; args?: unknown }
+) {
+  // Route command to any connected agents owned by this user
+  const { agents: agentsTable } = await import('../db/schema.js');
+  const userAgents = await db.select({ id: agentsTable.id })
+    .from(agentsTable)
+    .where(eq(agentsTable.ownerId, userId));
+
+  for (const agent of userAgents) {
+    sendToAgent(agent.id, { type: 'agent.command', data });
+  }
+
+  logger.info({ command: data.command, userId }, 'Agent command routed');
 }
 
 export async function subscribeUserToConversations(ws: WebSocket, userId: string) {

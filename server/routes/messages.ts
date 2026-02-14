@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { eq, and, desc, lt, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { messages, conversationMembers, users, messageStatus, conversations } from '../db/schema.js';
+import { messages, conversationMembers, users, messageStatus, conversations, attachments } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { validate, sendMessageSchema, editMessageSchema } from '../middleware/validate.js';
 import { messageRateLimit } from '../middleware/rate-limit.js';
@@ -104,10 +104,11 @@ messagesRouter.post('/:convId/messages', messageRateLimit, validate(sendMessageS
   const userId = c.get('userId');
   const convId = c.req.param('convId');
   const body = (c as any).get('validatedBody') as {
-    content: string;
+    content?: string;
     type: string;
     replyToId?: string;
     metadata?: Record<string, unknown>;
+    attachmentIds?: string[];
   };
 
   const membership = await checkMembership(convId, userId);
@@ -122,10 +123,19 @@ messagesRouter.post('/:convId/messages', messageRateLimit, validate(sendMessageS
     senderId: userId,
     seq,
     type: body.type,
-    content: body.content,
+    content: body.content || null,
     metadata: body.metadata || {},
     replyToId: body.replyToId || null,
   }).returning();
+
+  // Link pre-uploaded attachments to this message
+  if (body.attachmentIds?.length) {
+    for (const attachmentId of body.attachmentIds) {
+      await db.update(attachments)
+        .set({ messageId: message.id })
+        .where(eq(attachments.id, attachmentId));
+    }
+  }
 
   // Get sender info
   const [sender] = await db.select({

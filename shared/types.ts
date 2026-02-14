@@ -112,6 +112,7 @@ export interface Agent {
   skills: string[];
   sandbox: string;
   heartbeat: string | null;
+  config: AgentConfig;
   state: AgentState;
   isPrimary: boolean;
   parentId: string | null;
@@ -119,6 +120,26 @@ export interface Agent {
 }
 
 export type AgentState = 'idle' | 'working' | 'paused' | 'error';
+
+// ── Agent Config (OpenClaw v2026.2.13+) ─────────
+// Typed config fields that map to OpenClaw gateway settings.
+// Stored in agents.config JSONB column.
+
+export interface AgentConfig {
+  $schema?: string;
+  gateway?: {
+    tools?: {
+      allow?: string[];   // tool names explicitly allowed (e.g. ['sessions_spawn'])
+      deny?: string[];    // tool names explicitly denied
+    };
+  };
+  session?: {
+    dmScope?: 'user' | 'conversation';   // multi-user DM isolation mode
+    replyToMode?: 'auto' | 'explicit' | 'off';  // implicit reply threading
+  };
+  historyLimit?: number;   // max messages sent as context to the agent
+  [key: string]: unknown;  // preserve arbitrary keys like $schema
+}
 
 // ── WebSocket Event Types ───────────────────────
 
@@ -142,7 +163,8 @@ export type ServerEvent =
   | { type: 'agent.tool_end'; data: { taskId: string; step: ToolStep } }
   | { type: 'agent.dispatch'; data: { taskId: string; agents: DispatchAgent[] } }
   | { type: 'agent.cost'; data: { sessionId: string; tokens: number; usd: number } }
-  | { type: 'agent.approval'; data: { taskId: string; action: string; detail: string } }
+  | { type: 'agent.approval'; data: { taskId: string; action: string; detail: string; diff?: { path: string; before: string | null; after: string; language?: string }[] } }
+  | { type: 'agent.context_diagnostics'; data: { sessionId: string; messageCount: number; tokenCount: number; provider: string; model: string } }
   // Live Activity events (iOS Dynamic Island / Android ongoing notification)
   | { type: 'activity.start'; data: LiveActivity }
   | { type: 'activity.update'; data: Partial<LiveActivity> & { id: string } }

@@ -48,11 +48,15 @@ export const createConversationSchema = z.object({
 });
 
 export const sendMessageSchema = z.object({
-  content: z.string().min(1).max(10000),
+  content: z.string().min(1).max(10000).optional(),
   type: z.enum(['text', 'system', 'code']).default('text'),
   replyToId: z.string().uuid().optional(),
   metadata: z.record(z.unknown()).optional(),
-});
+  attachmentIds: z.array(z.string().uuid()).optional(),
+}).refine(
+  (data) => data.content || (data.attachmentIds && data.attachmentIds.length > 0),
+  { message: 'Message must have content or at least one attachment' }
+);
 
 export const editMessageSchema = z.object({
   content: z.string().min(1).max(10000),

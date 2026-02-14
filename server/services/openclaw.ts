@@ -7,6 +7,7 @@ import { logger } from './logger.js';
 import { config } from '../config.js';
 import { liveActivityService } from './live-activity.js';
 import { sql } from 'drizzle-orm';
+import type { AgentConfig } from '../../shared/types.js';
 
 interface AgentSessionState {
   agentId: string;
@@ -95,15 +96,38 @@ export class OpenClawBridge {
     }
 
     const session = await this.getOrCreateSession(agentId, conversationId);
+    const agentConfig = (agent.config || {}) as AgentConfig;
 
-    this.ws!.send(JSON.stringify({
+    const payload: Record<string, unknown> = {
       type: 'message',
       session: session.gatewaySessionId,
       agent_id: agentId,
       content: message,
       model: agent.model,
       conversation_id: conversationId,
-    }));
+    };
+
+    // Forward gateway tool permissions (v2026.2.13+)
+    if (agentConfig.gateway?.tools) {
+      payload.tools = agentConfig.gateway.tools;
+    }
+
+    // Forward history limit for context compaction (v2026.2.13+)
+    if (agentConfig.historyLimit) {
+      payload.history_limit = agentConfig.historyLimit;
+    }
+
+    // Forward DM scope for multi-user isolation (v2026.2.13+)
+    if (agentConfig.session?.dmScope) {
+      payload.dm_scope = agentConfig.session.dmScope;
+    }
+
+    // Forward reply threading mode (v2026.2.13+)
+    if (agentConfig.session?.replyToMode) {
+      payload.reply_to_mode = agentConfig.session.replyToMode;
+    }
+
+    this.ws!.send(JSON.stringify(payload));
 
     // Update agent state to working
     await db.update(agents)
@@ -260,12 +284,36 @@ export class OpenClawBridge {
         const session = this.findSessionByGateway(event.session);
         if (!session) return;
 
+        const approvalData: Record<string, unknown> = {
+          taskId: event.task_id,
+          action: event.action,
+          detail: event.detail,
+        };
+
+        // Forward structured diff data if present (v2026.2.13+)
+        if (event.diff) {
+          approvalData.diff = event.diff;
+        }
+
         redisPub.publish(`conv:${session.conversationId}`, JSON.stringify({
           type: 'agent.approval',
+          data: approvalData,
+        }));
+        break;
+      }
+
+      case 'context_diagnostics': {
+        const session = this.findSessionByGateway(event.session);
+        if (!session) return;
+
+        redisPub.publish(`conv:${session.conversationId}`, JSON.stringify({
+          type: 'agent.context_diagnostics',
           data: {
-            taskId: event.task_id,
-            action: event.action,
-            detail: event.detail,
+            sessionId: session.sessionDbId,
+            messageCount: event.message_count ?? 0,
+            tokenCount: event.token_count ?? 0,
+            provider: event.provider ?? '',
+            model: event.model ?? '',
           },
         }));
         break;
@@ -396,6 +444,37 @@ export class OpenClawBridge {
       type: 'message.new',
       data: { ...msg, sender },
     }));
+  }
+
+  // Route approval response from client back to OpenClaw gateway
+  async sendApprovalResponse(taskId: string, approved: boolean, conversationId: string): Promise<void> {
+    if (!this.isConnected()) {
+      logger.warn('Cannot send approval response: Gateway not connected');
+      return;
+    }
+
+    // Find session by conversation
+    let targetSession: AgentSessionState | undefined;
+    for (const session of this.sessions.values()) {
+      if (session.conversationId === conversationId) {
+        targetSession = session;
+        break;
+      }
+    }
+
+    if (!targetSession) {
+      logger.warn({ taskId, conversationId }, 'No active session for approval response');
+      return;
+    }
+
+    this.ws!.send(JSON.stringify({
+      type: 'approval_response',
+      session: targetSession.gatewaySessionId,
+      task_id: taskId,
+      approved,
+    }));
+
+    logger.info({ taskId, approved }, 'Approval response sent to gateway');
   }
 
   async disconnect(): Promise<void> {
