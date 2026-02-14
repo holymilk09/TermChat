@@ -3,18 +3,10 @@ import { lt, eq, and, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { messages, agentSessions, pairingCodes, deviceAuthRequests } from '../db/schema.js';
 import { logger } from '../services/logger.js';
+import { parseRedisUrl } from './queue.js';
 
 interface CleanupJobData {
   type: 'expired_messages' | 'stale_sessions' | 'old_messages' | 'expired_pairing';
-}
-
-function parseRedisUrl(url: string) {
-  const parsed = new URL(url);
-  return {
-    host: parsed.hostname,
-    port: parseInt(parsed.port) || 6379,
-    password: parsed.password || undefined,
-  };
 }
 
 export function startCleanupWorker(redisUrl: string) {

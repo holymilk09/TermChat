@@ -1,12 +1,12 @@
 import WebSocket from 'ws';
-import { eq, and } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { agents, agentSessions, agentTasks, messages, users, conversations } from '../db/schema.js';
-import { redis, redisPub } from './redis.js';
+import { agents, agentSessions, agentTasks } from '../db/schema.js';
+import { redisPub } from './redis.js';
 import { logger } from './logger.js';
 import { config } from '../config.js';
 import { liveActivityService } from './live-activity.js';
-import { sql } from 'drizzle-orm';
+import { createMessage } from './message.js';
 import type { AgentConfig } from '../../shared/types.js';
 
 interface AgentSessionState {
@@ -406,13 +406,6 @@ export class OpenClawBridge {
   }
 
   private async storeAndBroadcast(session: AgentSessionState, content: string): Promise<void> {
-    // Get next sequence
-    const [seqResult] = await db.select({
-      maxSeq: sql<number>`COALESCE(MAX(${messages.seq}), 0) + 1`,
-    })
-      .from(messages)
-      .where(eq(messages.conversationId, session.conversationId));
-
     // Get agent's bot user ID
     const [agent] = await db.select({ botUserId: agents.botUserId })
       .from(agents)
@@ -421,33 +414,21 @@ export class OpenClawBridge {
 
     if (!agent?.botUserId) return;
 
-    const [msg] = await db.insert(messages).values({
+    await createMessage({
       conversationId: session.conversationId,
       senderId: agent.botUserId,
-      seq: seqResult.maxSeq,
-      type: 'text',
       content,
-    }).returning();
-
-    const [sender] = await db.select({
-      id: users.id,
-      username: users.username,
-      displayName: users.displayName,
-      avatarUrl: users.avatarUrl,
-      isBot: users.isBot,
-    })
-      .from(users)
-      .where(eq(users.id, agent.botUserId))
-      .limit(1);
-
-    redisPub.publish(`conv:${session.conversationId}`, JSON.stringify({
-      type: 'message.new',
-      data: { ...msg, sender },
-    }));
+    });
   }
 
   // Route approval response from client back to OpenClaw gateway
-  async sendApprovalResponse(taskId: string, approved: boolean, conversationId: string): Promise<void> {
+  async sendApprovalResponse(
+    taskId: string,
+    approved: boolean,
+    conversationId: string,
+    reason?: string,
+    edits?: { path: string; content: string }[],
+  ): Promise<void> {
     if (!this.isConnected()) {
       logger.warn('Cannot send approval response: Gateway not connected');
       return;
@@ -467,14 +448,25 @@ export class OpenClawBridge {
       return;
     }
 
-    this.ws!.send(JSON.stringify({
+    const payload: Record<string, unknown> = {
       type: 'approval_response',
       session: targetSession.gatewaySessionId,
       task_id: taskId,
       approved,
-    }));
+    };
 
-    logger.info({ taskId, approved }, 'Approval response sent to gateway');
+    if (reason) {
+      payload.reason = reason;
+    }
+
+    if (edits?.length) {
+      payload.edits = edits;
+    }
+
+    this.ws!.send(JSON.stringify(payload));
+
+    const decision = approved ? 'approved' : (edits?.length ? 'adjusted' : 'denied');
+    logger.info({ taskId, decision }, 'Approval response sent to gateway');
   }
 
   async disconnect(): Promise<void> {

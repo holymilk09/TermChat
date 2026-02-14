@@ -165,6 +165,7 @@ export type ServerEvent =
   | { type: 'agent.cost'; data: { sessionId: string; tokens: number; usd: number } }
   | { type: 'agent.approval'; data: { taskId: string; action: string; detail: string; diff?: { path: string; before: string | null; after: string; language?: string }[] } }
   | { type: 'agent.context_diagnostics'; data: { sessionId: string; messageCount: number; tokenCount: number; provider: string; model: string } }
+  | { type: 'agent.approval_resolved'; data: { taskId: string; decision: 'approved' | 'denied' | 'adjusted'; respondedBy: string; reason: string | null; hasEdits: boolean } }
   // Live Activity events (iOS Dynamic Island / Android ongoing notification)
   | { type: 'activity.start'; data: LiveActivity }
   | { type: 'activity.update'; data: Partial<LiveActivity> & { id: string } }
@@ -176,7 +177,7 @@ export type ClientEvent =
   | { type: 'typing.start'; data: { conversationId: string } }
   | { type: 'typing.stop'; data: { conversationId: string } }
   | { type: 'message.read'; data: { conversationId: string; upToSeq: number } }
-  | { type: 'approval.respond'; data: { taskId: string; approved: boolean } }
+  | { type: 'approval.respond'; data: { taskId: string; approved: boolean; reason?: string; edits?: { path: string; content: string }[] } }
   | { type: 'agent.command'; data: { command: string; args?: unknown } };
 
 export interface ToolStep {
@@ -290,7 +291,7 @@ export type AgentServerEvent =
   | { type: 'connected'; data: { agentId: string; slug: string; name: string; conversations: string[]; protocol: string } }
   | { type: 'message.new'; data: Message }
   | { type: 'message.ack'; data: { messageId: string; seq: number } }
-  | { type: 'approval.respond'; data: { taskId: string; approved: boolean } }
+  | { type: 'approval.respond'; data: { taskId: string; approved: boolean; reason?: string; edits?: { path: string; content: string }[] } }
   | { type: 'agent.command'; data: { command: string; args?: unknown } }
   | { type: 'error'; data: { message: string } };
 

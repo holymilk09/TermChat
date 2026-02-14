@@ -1,12 +1,13 @@
 import type { WebSocket } from 'ws';
 import { eq, and, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { messages, conversationMembers, users, messageStatus, conversations } from '../db/schema.js';
-import { redis, redisPub } from '../services/redis.js';
+import { conversationMembers, messages, messageStatus, agentTasks, agents as agentsTable } from '../db/schema.js';
+import { redis } from '../services/redis.js';
 import { logger } from '../services/logger.js';
 import { subscribeToChannel, publishToChannel } from './rooms.js';
 import { openclawBridge } from '../services/openclaw.js';
 import { sendToAgent } from './agent-gateway.js';
+import { createMessage } from '../services/message.js';
 import type { ClientEvent } from '../../shared/types.js';
 
 export async function handleClientEvent(ws: WebSocket, userId: string, username: string, event: ClientEvent) {
@@ -53,61 +54,14 @@ async function handleMessageSend(
     return;
   }
 
-  // Get next sequence number
-  const [seqResult] = await db.select({
-    maxSeq: sql<number>`COALESCE(MAX(${messages.seq}), 0) + 1`,
-  })
-    .from(messages)
-    .where(eq(messages.conversationId, data.conversationId));
-
-  const [message] = await db.insert(messages).values({
-    conversationId: data.conversationId,
-    senderId: userId,
-    seq: seqResult.maxSeq,
-    type: 'text',
-    content: data.content,
-    replyToId: data.replyTo || null,
-  }).returning();
-
-  // Get sender info
-  const [sender] = await db.select({
-    id: users.id,
-    username: users.username,
-    displayName: users.displayName,
-    avatarUrl: users.avatarUrl,
-    isBot: users.isBot,
-  })
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
-
-  // Update conversation timestamp
-  await db.update(conversations)
-    .set({ updatedAt: new Date() })
-    .where(eq(conversations.id, data.conversationId));
-
-  // Create status records for other members
-  const members = await db.select({ userId: conversationMembers.userId })
-    .from(conversationMembers)
-    .where(eq(conversationMembers.conversationId, data.conversationId));
-
-  for (const member of members) {
-    if (member.userId !== userId) {
-      await db.insert(messageStatus).values({
-        messageId: message.id,
-        userId: member.userId,
-        status: 'sent',
-      });
-    }
-  }
-
   // Clear typing indicator
   await redis.del(`typing:${data.conversationId}:${userId}`);
 
-  // Broadcast
-  publishToChannel(`conv:${data.conversationId}`, {
-    type: 'message.new',
-    data: { ...message, sender },
+  await createMessage({
+    conversationId: data.conversationId,
+    senderId: userId,
+    content: data.content,
+    replyToId: data.replyTo,
   });
 }
 
@@ -161,10 +115,9 @@ async function handleMessageRead(userId: string, conversationId: string, upToSeq
 
 async function handleApprovalRespond(
   userId: string,
-  data: { taskId: string; approved: boolean }
+  data: { taskId: string; approved: boolean; reason?: string; edits?: { path: string; content: string }[] }
 ) {
   // Find which conversation and agent this approval belongs to
-  const { agentTasks } = await import('../db/schema.js');
   const [task] = await db.select({
     conversationId: agentTasks.conversationId,
     agentId: agentTasks.agentId,
@@ -192,15 +145,42 @@ async function handleApprovalRespond(
     return;
   }
 
-  // Route to OpenClaw gateway
-  await openclawBridge.sendApprovalResponse(data.taskId, data.approved, task.conversationId);
+  // Record the decision in the DB
+  const decision = data.approved ? 'approved' : (data.edits?.length ? 'adjusted' : 'denied');
+  await db.update(agentTasks)
+    .set({
+      status: decision,
+      output: {
+        decision,
+        respondedBy: userId,
+        reason: data.reason || null,
+        edits: data.edits || null,
+        respondedAt: new Date().toISOString(),
+      } as Record<string, unknown>,
+    })
+    .where(eq(agentTasks.id, data.taskId));
+
+  // Route to OpenClaw gateway (with reason/edits)
+  await openclawBridge.sendApprovalResponse(data.taskId, data.approved, task.conversationId, data.reason, data.edits);
 
   // Also try routing to directly connected agents (use agentId, not userId)
   if (task.agentId) {
     sendToAgent(task.agentId, { type: 'approval.respond', data });
   }
 
-  logger.info({ taskId: data.taskId, approved: data.approved, userId }, 'Approval response routed');
+  // Broadcast decision back to conversation so all clients can update UI
+  publishToChannel(`conv:${task.conversationId}`, {
+    type: 'agent.approval_resolved',
+    data: {
+      taskId: data.taskId,
+      decision,
+      respondedBy: userId,
+      reason: data.reason || null,
+      hasEdits: !!(data.edits?.length),
+    },
+  });
+
+  logger.info({ taskId: data.taskId, decision, userId }, 'Approval response routed');
 }
 
 async function handleAgentCommand(
@@ -208,7 +188,6 @@ async function handleAgentCommand(
   data: { command: string; args?: unknown }
 ) {
   // Route command to any connected agents owned by this user
-  const { agents: agentsTable } = await import('../db/schema.js');
   const userAgents = await db.select({ id: agentsTable.id })
     .from(agentsTable)
     .where(eq(agentsTable.ownerId, userId));

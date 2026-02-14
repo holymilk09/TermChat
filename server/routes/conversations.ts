@@ -36,60 +36,94 @@ conversationsRouter.get('/', async (c) => {
     .where(inArray(conversations.id, convIds))
     .orderBy(desc(conversations.updatedAt));
 
-  // Get last message for each conversation
-  const result = await Promise.all(convs.map(async (conv) => {
-    const membership = memberOf.find(m => m.conversationId === conv.id)!;
+  // Batch: last message per conversation (DISTINCT ON avoids N+1)
+  const lastMessages = await db.execute<{
+    conversation_id: string;
+    id: string;
+    content: string | null;
+    sender_id: string;
+    type: string;
+    seq: number;
+    created_at: string;
+  }>(sql`
+    SELECT DISTINCT ON (conversation_id)
+      conversation_id, id, content, sender_id, type, seq, created_at
+    FROM messages
+    WHERE conversation_id = ANY(${convIds})
+    ORDER BY conversation_id, seq DESC
+  `);
 
-    const [lastMessage] = await db.select({
-      id: messages.id,
-      content: messages.content,
-      senderId: messages.senderId,
-      type: messages.type,
-      seq: messages.seq,
-      createdAt: messages.createdAt,
-    })
-      .from(messages)
-      .where(eq(messages.conversationId, conv.id))
-      .orderBy(desc(messages.seq))
-      .limit(1);
+  const lastMessageMap = new Map(
+    (lastMessages.rows ?? lastMessages).map((m: any) => [m.conversation_id, {
+      id: m.id,
+      content: m.content,
+      senderId: m.sender_id,
+      type: m.type,
+      seq: Number(m.seq),
+      createdAt: m.created_at,
+    }])
+  );
 
-    // Get unread count
-    let unreadCount = 0;
-    if (membership.lastReadAt) {
-      const [{ count }] = await db.select({ count: sql<number>`count(*)::int` })
-        .from(messages)
-        .where(
-          and(
-            eq(messages.conversationId, conv.id),
-            sql`${messages.createdAt} > ${membership.lastReadAt}`
-          )
-        );
-      unreadCount = count;
+  // Batch: unread counts per conversation
+  // Build a values list of (convId, lastReadAt) for conversations with a lastReadAt
+  const readPairs = memberOf.filter(m => m.lastReadAt);
+  const unreadMap = new Map<string, number>();
+
+  if (readPairs.length > 0) {
+    // Use a single query with CASE/SUM to count unreads across all conversations
+    const unreadResults = await db.execute<{
+      conversation_id: string;
+      unread: number;
+    }>(sql`
+      SELECT m.conversation_id, count(*)::int AS unread
+      FROM messages m
+      INNER JOIN (
+        SELECT unnest(${readPairs.map(p => p.conversationId)}::uuid[]) AS conv_id,
+               unnest(${readPairs.map(p => p.lastReadAt!.toISOString())}::timestamptz[]) AS last_read
+      ) AS r ON m.conversation_id = r.conv_id
+      WHERE m.created_at > r.last_read
+      GROUP BY m.conversation_id
+    `);
+
+    for (const row of (unreadResults.rows ?? unreadResults) as any[]) {
+      unreadMap.set(row.conversation_id, row.unread);
     }
+  }
 
-    // Get members
-    const members = await db.select({
-      userId: conversationMembers.userId,
-      role: conversationMembers.role,
-      username: users.username,
-      displayName: users.displayName,
-      avatarUrl: users.avatarUrl,
-      isBot: users.isBot,
-      status: users.status,
-    })
-      .from(conversationMembers)
-      .innerJoin(users, eq(conversationMembers.userId, users.id))
-      .where(eq(conversationMembers.conversationId, conv.id));
+  // Batch: all members for all conversations in one query
+  const allMembers = await db.select({
+    conversationId: conversationMembers.conversationId,
+    userId: conversationMembers.userId,
+    role: conversationMembers.role,
+    username: users.username,
+    displayName: users.displayName,
+    avatarUrl: users.avatarUrl,
+    isBot: users.isBot,
+    status: users.status,
+  })
+    .from(conversationMembers)
+    .innerJoin(users, eq(conversationMembers.userId, users.id))
+    .where(inArray(conversationMembers.conversationId, convIds));
 
+  const membersMap = new Map<string, typeof allMembers>();
+  for (const member of allMembers) {
+    const list = membersMap.get(member.conversationId) ?? [];
+    list.push(member);
+    membersMap.set(member.conversationId, list);
+  }
+
+  // Assemble results
+  const result = convs.map(conv => {
+    const membership = memberOf.find(m => m.conversationId === conv.id)!;
     return {
       ...conv,
-      members,
-      lastMessage: lastMessage || null,
-      unreadCount,
+      members: membersMap.get(conv.id) ?? [],
+      lastMessage: lastMessageMap.get(conv.id) ?? null,
+      unreadCount: unreadMap.get(conv.id) ?? 0,
       pinned: membership.pinned,
       role: membership.role,
     };
-  }));
+  });
 
   return c.json({ data: result });
 });

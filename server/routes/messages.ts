@@ -1,12 +1,13 @@
 import { Hono } from 'hono';
 import { eq, and, desc, lt, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { messages, conversationMembers, users, messageStatus, conversations, attachments } from '../db/schema.js';
+import { messages, conversationMembers, users, messageStatus } from '../db/schema.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { validate, sendMessageSchema, editMessageSchema } from '../middleware/validate.js';
 import { messageRateLimit } from '../middleware/rate-limit.js';
 import { redisPub } from '../services/redis.js';
 import { logger } from '../services/logger.js';
+import { createMessage } from '../services/message.js';
 
 const messagesRouter = new Hono();
 
@@ -22,16 +23,6 @@ async function checkMembership(convId: string, userId: string) {
     ))
     .limit(1);
   return membership;
-}
-
-// Helper: get next sequence number for conversation
-async function getNextSeq(convId: string): Promise<number> {
-  const [result] = await db.select({
-    maxSeq: sql<number>`COALESCE(MAX(${messages.seq}), 0) + 1`,
-  })
-    .from(messages)
-    .where(eq(messages.conversationId, convId));
-  return result.maxSeq;
 }
 
 // GET /api/conversations/:convId/messages — paginated messages
@@ -116,71 +107,17 @@ messagesRouter.post('/:convId/messages', messageRateLimit, validate(sendMessageS
     return c.json({ error: 'forbidden', message: 'Not a member of this conversation' }, 403);
   }
 
-  const seq = await getNextSeq(convId);
-
-  const [message] = await db.insert(messages).values({
+  const messageWithSender = await createMessage({
     conversationId: convId,
     senderId: userId,
-    seq,
+    content: body.content,
     type: body.type,
-    content: body.content || null,
-    metadata: body.metadata || {},
-    replyToId: body.replyToId || null,
-  }).returning();
+    replyToId: body.replyToId,
+    metadata: body.metadata,
+    attachmentIds: body.attachmentIds,
+  });
 
-  // Link pre-uploaded attachments to this message
-  if (body.attachmentIds?.length) {
-    for (const attachmentId of body.attachmentIds) {
-      await db.update(attachments)
-        .set({ messageId: message.id })
-        .where(eq(attachments.id, attachmentId));
-    }
-  }
-
-  // Get sender info
-  const [sender] = await db.select({
-    id: users.id,
-    username: users.username,
-    displayName: users.displayName,
-    avatarUrl: users.avatarUrl,
-    isBot: users.isBot,
-  })
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
-
-  // Update conversation's updatedAt
-  await db.update(conversations)
-    .set({ updatedAt: new Date() })
-    .where(eq(conversations.id, convId));
-
-  // Create message status for all members (except sender)
-  const members = await db.select({ userId: conversationMembers.userId })
-    .from(conversationMembers)
-    .where(eq(conversationMembers.conversationId, convId));
-
-  for (const member of members) {
-    if (member.userId !== userId) {
-      await db.insert(messageStatus).values({
-        messageId: message.id,
-        userId: member.userId,
-        status: 'sent',
-      });
-    }
-  }
-
-  const messageWithSender = {
-    ...message,
-    sender,
-  };
-
-  // Broadcast to conversation channel
-  redisPub.publish(`conv:${convId}`, JSON.stringify({
-    type: 'message.new',
-    data: messageWithSender,
-  }));
-
-  logger.debug({ messageId: message.id, convId }, 'Message sent');
+  logger.debug({ messageId: messageWithSender.id, convId }, 'Message sent');
 
   return c.json(messageWithSender, 201);
 });

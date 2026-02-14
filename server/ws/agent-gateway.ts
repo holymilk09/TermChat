@@ -2,22 +2,20 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'http';
 import type { IncomingMessage } from 'http';
 import bcrypt from 'bcrypt';
-import { eq, and, isNull, sql } from 'drizzle-orm';
+import { eq, and, isNull } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import {
   agentTokens,
   agents,
   agentSessions,
   agentTasks,
-  messages,
-  users,
-  conversations,
   conversationMembers,
 } from '../db/schema.js';
 import { redis, redisPub } from '../services/redis.js';
 import { subscribeToChannel, publishToChannel, cleanupConnection } from './rooms.js';
 import { logger } from '../services/logger.js';
 import { liveActivityService } from '../services/live-activity.js';
+import { createMessage } from '../services/message.js';
 
 // ═══════════════════════════════════════════════════
 // Agent WebSocket Gateway — /ws/agent
@@ -429,47 +427,15 @@ async function handleAgentMessage(
     return;
   }
 
-  // Get next sequence number
-  const [seqResult] = await db.select({
-    maxSeq: sql<number>`COALESCE(MAX(${messages.seq}), 0) + 1`,
-  })
-    .from(messages)
-    .where(eq(messages.conversationId, data.conversationId));
-
-  // Store message
-  const [message] = await db.insert(messages).values({
-    conversationId: data.conversationId,
-    senderId: ws.botUserId,
-    seq: seqResult.maxSeq,
-    type: data.type || 'text',
-    content: data.content,
-    metadata: data.metadata || {},
-  }).returning();
-
-  // Get sender info (the bot user)
-  const [sender] = await db.select({
-    id: users.id,
-    username: users.username,
-    displayName: users.displayName,
-    avatarUrl: users.avatarUrl,
-    isBot: users.isBot,
-  })
-    .from(users)
-    .where(eq(users.id, ws.botUserId))
-    .limit(1);
-
-  // Update conversation timestamp
-  await db.update(conversations)
-    .set({ updatedAt: new Date() })
-    .where(eq(conversations.id, data.conversationId));
-
   // Clear typing indicator
   await redis.del(`typing:${data.conversationId}:${ws.botUserId}`);
 
-  // Broadcast to all subscribers of this conversation
-  publishToChannel(`conv:${data.conversationId}`, {
-    type: 'message.new',
-    data: { ...message, sender },
+  const message = await createMessage({
+    conversationId: data.conversationId,
+    senderId: ws.botUserId,
+    content: data.content,
+    type: data.type,
+    metadata: data.metadata,
   });
 
   // Acknowledge to the agent

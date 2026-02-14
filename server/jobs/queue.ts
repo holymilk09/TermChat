@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { logger } from '../services/logger.js';
 
 // Parse Redis URL for BullMQ connection
-function parseRedisUrl(url: string) {
+export function parseRedisUrl(url: string) {
   const parsed = new URL(url);
   return {
     host: parsed.hostname,

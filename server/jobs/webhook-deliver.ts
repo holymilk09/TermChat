@@ -4,6 +4,7 @@ import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { webhooks } from '../db/schema.js';
 import { logger } from '../services/logger.js';
+import { parseRedisUrl } from './queue.js';
 
 const WEBHOOK_TIMEOUT = 10000;
 
@@ -13,15 +14,6 @@ interface WebhookJobData {
   secret: string | null;
   event: string;
   payload: unknown;
-}
-
-function parseRedisUrl(url: string) {
-  const parsed = new URL(url);
-  return {
-    host: parsed.hostname,
-    port: parseInt(parsed.port) || 6379,
-    password: parsed.password || undefined,
-  };
 }
 
 export function startWebhookWorker(redisUrl: string) {

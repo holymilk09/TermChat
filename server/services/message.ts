@@ -1,38 +1,56 @@
 import { eq, and, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { messages, conversationMembers, messageStatus, conversations, users } from '../db/schema.js';
+import { messages, conversationMembers, messageStatus, conversations, users, attachments } from '../db/schema.js';
 import { redisPub } from './redis.js';
 import { deliverWebhook } from './webhook.js';
 import { logger } from './logger.js';
 
-// Central message service — used by both REST and WebSocket handlers
+// Central message service — single source of truth for creating messages.
+// Used by REST route, WS handler, agent-gateway, and openclaw bridge.
 
 export async function createMessage(opts: {
   conversationId: string;
   senderId: string;
-  content: string;
+  content?: string | null;
   type?: string;
   replyToId?: string | null;
   metadata?: Record<string, unknown>;
+  attachmentIds?: string[];
 }) {
-  const { conversationId, senderId, content, type = 'text', replyToId, metadata } = opts;
+  const { conversationId, senderId, content = null, type = 'text', replyToId, metadata, attachmentIds } = opts;
 
-  // Get next seq
-  const [seqResult] = await db.select({
-    maxSeq: sql<number>`COALESCE(MAX(${messages.seq}), 0) + 1`,
-  })
-    .from(messages)
-    .where(eq(messages.conversationId, conversationId));
+  // Atomic seq assignment + insert inside a transaction with advisory lock.
+  // pg_advisory_xact_lock scopes the lock to this transaction; hashtext gives
+  // a stable int4 from the conversation UUID so concurrent inserts to the
+  // same conversation serialize while different conversations proceed in parallel.
+  const [message] = await db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${conversationId}))`);
 
-  const [message] = await db.insert(messages).values({
-    conversationId,
-    senderId,
-    seq: seqResult.maxSeq,
-    type,
-    content,
-    replyToId: replyToId || null,
-    metadata: metadata || {},
-  }).returning();
+    const [seqResult] = await tx.select({
+      nextSeq: sql<number>`COALESCE(MAX(${messages.seq}), 0) + 1`,
+    })
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId));
+
+    return tx.insert(messages).values({
+      conversationId,
+      senderId,
+      seq: seqResult.nextSeq,
+      type,
+      content,
+      replyToId: replyToId || null,
+      metadata: metadata || {},
+    }).returning();
+  });
+
+  // Link pre-uploaded attachments to this message
+  if (attachmentIds?.length) {
+    for (const attachmentId of attachmentIds) {
+      await db.update(attachments)
+        .set({ messageId: message.id })
+        .where(eq(attachments.id, attachmentId));
+    }
+  }
 
   // Get sender info
   const [sender] = await db.select({
@@ -51,7 +69,7 @@ export async function createMessage(opts: {
     .set({ updatedAt: new Date() })
     .where(eq(conversations.id, conversationId));
 
-  // Create status records for other members
+  // Create status records for other members (batch insert)
   const members = await db.select({ userId: conversationMembers.userId })
     .from(conversationMembers)
     .where(eq(conversationMembers.conversationId, conversationId));
@@ -76,18 +94,21 @@ export async function createMessage(opts: {
     data: messageWithSender,
   }));
 
-  // Deliver webhooks to bot members
-  const botMembers = members.filter(m => m.userId !== senderId);
-  for (const member of botMembers) {
-    const [user] = await db.select({ isBot: users.isBot })
-      .from(users)
-      .where(eq(users.id, member.userId))
-      .limit(1);
-
-    if (user?.isBot) {
-      deliverWebhook(member.userId, 'message.new', messageWithSender).catch(err => {
-        logger.error({ err, botUserId: member.userId }, 'Failed to deliver webhook');
-      });
+  // Deliver webhooks to bot members (non-blocking)
+  for (const member of members) {
+    if (member.userId !== senderId) {
+      db.select({ isBot: users.isBot })
+        .from(users)
+        .where(and(eq(users.id, member.userId), eq(users.isBot, true)))
+        .limit(1)
+        .then(([user]) => {
+          if (user) {
+            deliverWebhook(member.userId, 'message.new', messageWithSender).catch(err => {
+              logger.error({ err, botUserId: member.userId }, 'Failed to deliver webhook');
+            });
+          }
+        })
+        .catch(() => {});
     }
   }
 
