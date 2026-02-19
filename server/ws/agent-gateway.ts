@@ -16,6 +16,7 @@ import { subscribeToChannel, publishToChannel, cleanupConnection } from './rooms
 import { logger } from '../services/logger.js';
 import { liveActivityService } from '../services/live-activity.js';
 import { createMessage } from '../services/message.js';
+import { runtimeManager } from '../services/agent-runtime-manager.js';
 
 // ═══════════════════════════════════════════════════
 // Agent WebSocket Gateway — /ws/agent
@@ -155,6 +156,7 @@ export function setupAgentGateway(server: Server): WebSocketServer {
 
     // Register connection
     registerAgentConnection(authResult.agentId, agentWs);
+    runtimeManager.bindAgent(authResult.agentId, 'direct');
 
     // Update agent state and presence
     await db.update(agents)
@@ -229,6 +231,7 @@ export function setupAgentGateway(server: Server): WebSocketServer {
       // Grace period before marking offline
       setTimeout(async () => {
         if (!isAgentOnline(authResult.agentId)) {
+          runtimeManager.unbindAgent(authResult.agentId);
           await db.update(agents)
             .set({ state: 'idle', updatedAt: new Date() })
             .where(eq(agents.id, authResult.agentId));

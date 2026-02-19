@@ -8,6 +8,7 @@ import { config } from '../config.js';
 import { liveActivityService } from './live-activity.js';
 import { createMessage } from './message.js';
 import type { AgentConfig } from '../../shared/types.js';
+import type { NormalizedAgentEvent, NormalizedEventHandler } from './agent-runtime.js';
 
 interface AgentSessionState {
   agentId: string;
@@ -23,6 +24,14 @@ export class OpenClawBridge {
   private maxReconnectAttempts = 10;
   private reconnectDelay = 2000;
   private connected = false;
+
+  /** Optional callback for emitting normalized events to the runtime adapter. */
+  onNormalizedEvent: NormalizedEventHandler | null = null;
+
+  /** Check if an agent has an active session on this bridge. */
+  hasSession(agentId: string): boolean {
+    return this.sessions.has(agentId);
+  }
 
   async connect(gatewayUrl?: string): Promise<void> {
     const url = gatewayUrl || config.openclawGateway;
@@ -254,6 +263,15 @@ export class OpenClawBridge {
           },
         }));
 
+        this.onNormalizedEvent?.({
+          type: event.type === 'tool_start' ? 'tool_start' : 'tool_end',
+          agentId: session.agentId,
+          conversationId: session.conversationId,
+          taskId: event.task_id,
+          tool: event.tool,
+          ...(event.type === 'tool_start' ? { input: event.input } : { output: event.output, status: 'completed' }),
+        } as NormalizedAgentEvent);
+
         // Update live activity with current tool action
         const activityId = `la_${session.sessionDbId}`;
         if (event.type === 'tool_start') {
@@ -277,6 +295,13 @@ export class OpenClawBridge {
         if (!session) return;
 
         await this.storeAndBroadcast(session, event.content);
+
+        this.onNormalizedEvent?.({
+          type: 'message',
+          agentId: session.agentId,
+          conversationId: session.conversationId,
+          content: event.content,
+        });
         break;
       }
 
@@ -299,6 +324,16 @@ export class OpenClawBridge {
           type: 'agent.approval',
           data: approvalData,
         }));
+
+        this.onNormalizedEvent?.({
+          type: 'approval_request',
+          agentId: session.agentId,
+          conversationId: session.conversationId,
+          taskId: event.task_id,
+          action: event.action,
+          detail: event.detail,
+          diff: event.diff,
+        });
         break;
       }
 
@@ -316,6 +351,17 @@ export class OpenClawBridge {
             model: event.model ?? '',
           },
         }));
+
+        this.onNormalizedEvent?.({
+          type: 'context_diagnostics',
+          agentId: session.agentId,
+          conversationId: session.conversationId,
+          sessionId: session.sessionDbId,
+          messageCount: event.message_count ?? 0,
+          tokenCount: event.token_count ?? 0,
+          provider: event.provider ?? '',
+          model: event.model ?? '',
+        });
         break;
       }
 
@@ -361,6 +407,16 @@ export class OpenClawBridge {
           summary: event.summary || null,
         }).catch(() => {});
 
+        this.onNormalizedEvent?.({
+          type: 'session_complete',
+          agentId: session.agentId,
+          conversationId: session.conversationId,
+          sessionId: session.sessionDbId,
+          tokensUsed: event.tokens_used,
+          costUsd: event.cost_usd,
+          summary: event.summary,
+        });
+
         this.sessions.delete(session.agentId);
         break;
       }
@@ -389,6 +445,14 @@ export class OpenClawBridge {
           state: 'failed',
           summary: event.error || 'Agent encountered an error',
         }).catch(() => {});
+
+        this.onNormalizedEvent?.({
+          type: 'error',
+          agentId: session.agentId,
+          conversationId: session.conversationId,
+          sessionId: session.sessionDbId,
+          error: event.error,
+        });
 
         this.sessions.delete(session.agentId);
         break;
@@ -478,6 +542,3 @@ export class OpenClawBridge {
     this.sessions.clear();
   }
 }
-
-// Singleton
-export const openclawBridge = new OpenClawBridge();

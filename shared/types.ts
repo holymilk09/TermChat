@@ -138,6 +138,8 @@ export interface AgentConfig {
     replyToMode?: 'auto' | 'explicit' | 'off';  // implicit reply threading
   };
   historyLimit?: number;   // max messages sent as context to the agent
+  runtime?: string;        // preferred runtime type hint (e.g. 'openclaw', 'direct')
+  runtimeConfig?: { [runtimeType: string]: Record<string, unknown> };  // runtime-specific config
   [key: string]: unknown;  // preserve arbitrary keys like $schema
 }
 

@@ -18,7 +18,10 @@ import agentsRouter from './routes/agents.js';
 import pairingRouter from './routes/pairing.js';
 
 // Services
-import { openclawBridge } from './services/openclaw.js';
+import { OpenClawBridge } from './services/openclaw.js';
+import { runtimeManager } from './services/agent-runtime-manager.js';
+import { OpenClawRuntimeAdapter } from './services/openclaw-runtime.js';
+import { DirectGatewayRuntimeAdapter } from './services/direct-gateway-runtime.js';
 
 // Jobs
 import { setupCronJobs } from './jobs/cron.js';
@@ -79,10 +82,11 @@ async function startBackgroundServices() {
   // Setup scheduled jobs
   await setupCronJobs();
 
-  // Connect to OpenClaw Gateway (non-blocking, will reconnect)
-  openclawBridge.connect().catch(err => {
-    logger.warn({ err }, 'OpenClaw Gateway not available (will retry)');
-  });
+  // Register agent runtimes and initialize
+  const bridge = new OpenClawBridge();
+  runtimeManager.registerRuntime(new OpenClawRuntimeAdapter(bridge));
+  runtimeManager.registerRuntime(new DirectGatewayRuntimeAdapter());
+  await runtimeManager.initializeAll();
 
   logger.info('Background services started');
 }
@@ -95,7 +99,7 @@ startBackgroundServices().catch(err => {
 const shutdown = async () => {
   logger.info('Shutting down...');
 
-  await openclawBridge.disconnect();
+  await runtimeManager.shutdownAll();
   await closeQueues();
 
   const { redis, redisSub, redisPub } = await import('./services/redis.js');

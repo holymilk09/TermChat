@@ -5,8 +5,7 @@ import { conversationMembers, messages, messageStatus, agentTasks, agents as age
 import { redis } from '../services/redis.js';
 import { logger } from '../services/logger.js';
 import { subscribeToChannel, publishToChannel } from './rooms.js';
-import { openclawBridge } from '../services/openclaw.js';
-import { sendToAgent } from './agent-gateway.js';
+import { runtimeManager } from '../services/agent-runtime-manager.js';
 import { createMessage } from '../services/message.js';
 import type { ClientEvent } from '../../shared/types.js';
 
@@ -160,12 +159,11 @@ async function handleApprovalRespond(
     })
     .where(eq(agentTasks.id, data.taskId));
 
-  // Route to OpenClaw gateway (with reason/edits)
-  await openclawBridge.sendApprovalResponse(data.taskId, data.approved, task.conversationId, data.reason, data.edits);
-
-  // Also try routing to directly connected agents (use agentId, not userId)
+  // Route approval to the correct runtime for this agent
   if (task.agentId) {
-    sendToAgent(task.agentId, { type: 'approval.respond', data });
+    await runtimeManager.sendApprovalResponse(
+      task.agentId, data.taskId, data.approved, task.conversationId, data.reason, data.edits
+    );
   }
 
   // Broadcast decision back to conversation so all clients can update UI
@@ -193,7 +191,7 @@ async function handleAgentCommand(
     .where(eq(agentsTable.ownerId, userId));
 
   for (const agent of userAgents) {
-    sendToAgent(agent.id, { type: 'agent.command', data });
+    await runtimeManager.sendCommand(agent.id, data.command, data.args);
   }
 
   logger.info({ command: data.command, userId }, 'Agent command routed');
